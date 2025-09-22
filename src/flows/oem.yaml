@@ -1,0 +1,36 @@
+id: oem_flow
+entry: ask_oem
+states:
+  ask_oem:
+    prompt: "Отправьте номер OEM (минимум 3 символа)"
+    expect: oem
+    validate:
+      regex: "^[A-Za-z0-9._-]{3,}$"
+      on_fail: "Артикул слишком короткий или недопустимые символы."
+    next: fetch_part
+
+  fetch_part:
+    action: getPartByOEM
+    loading: "Ищу деталь по номеру..."
+    on_error: "Не нашлось по этому номеру. Проверьте и попробуйте ещё раз."
+    render: partCardWithButtons
+    next: wait_actions
+
+  wait_actions:
+    branches:
+      - when: "equals('analogs')"
+        next: fetch_analogs
+      - when: "startsWith('cart:')"
+        next: add_to_cart
+
+  fetch_analogs:
+    action: getCrossesByOEM
+    loading: "Подбираю аналоги..."
+    on_error: "Аналоги не найдены."
+    render: crossesList
+    next: wait_actions
+
+  add_to_cart:
+    action: addToCart
+    render: cartConfirm
+    next: wait_actions

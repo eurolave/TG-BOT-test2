@@ -1,0 +1,30 @@
+id: vin_flow
+entry: ask_vin
+states:
+  ask_vin:
+    prompt: "Отправьте VIN (17 символов, латиница/цифры, без I O Q)"
+    expect: vin
+    validate:
+      regex: "^[A-HJ-NPR-Z0-9]{17}$"
+      on_fail: "Это не похоже на VIN. Проверьте формат и повторите."
+    next: fetch_assemblies
+
+  fetch_assemblies:
+    action: getAssembliesByVIN
+    loading: "Ищу узлы по вашему VIN..."
+    on_error: "Не удалось получить данные по VIN. Попробуйте ещё раз."
+    render: assembliesList
+    next: wait_assembly
+
+  wait_assembly:
+    branches:
+      - when: "startsWith('asm:')"
+        next: fetch_parts
+
+  fetch_parts:
+    action: getPartsByAssembly
+    loading: "Получаю детали..."
+    on_error: "Не удалось получить детали для узла."
+    render: partsPaged
+    next: wait_parts
+  wait_parts: {}
