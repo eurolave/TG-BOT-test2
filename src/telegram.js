@@ -2,7 +2,7 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { getByVin } from './laximoClient.js';
 import { formatVinCardHtml } from './formatters.js';
-import { chunk, maskVin, escapeHtml } from './utils.js';
+import { chunk, maskVin, escapeHtml, fmtMoney } from './utils.js';
 import { chat as gptChat, reset as gptReset } from './gpt.js';
 
 const VIN_RE = /\b([A-HJ-NPR-Z0-9]{8,})\b/i;
@@ -12,7 +12,7 @@ function homeKeyboard() {
   return {
     keyboard: [
       [{ text: '🔎 Подбор по VIN' }, { text: '🤖 GPT-чат' }],
-      [{ text: '♻️ Сброс GPT контекста' }]
+      [{ text: '💳 Баланс' }, { text: '♻️ Сброс GPT контекста' }]
     ],
     resize_keyboard: true,
     is_persistent: true
@@ -69,6 +69,28 @@ function vinInlineKeyboard(payload) {
   };
 }
 
+/** ─────────────── User balance store (in-memory) ───────────────
+ * userId -> { balance: number, updatedAt: number }
+ * Простая in-memory реализация. Для прод-хранения — Redis/DB.
+ */
+const userStore = new Map();
+function getBalance(userId) {
+  const rec = userStore.get(userId) || { balance: 0, updatedAt: Date.now() };
+  userStore.set(userId, rec);
+  return rec.balance || 0;
+}
+function setBalance(userId, amount) {
+  userStore.set(userId, { balance: +amount || 0, updatedAt: Date.now() });
+}
+function addBalance(userId, amount) {
+  const cur = getBalance(userId);
+  setBalance(userId, cur + (+amount || 0));
+}
+function chargeBalance(userId, amount) {
+  const cur = getBalance(userId);
+  setBalance(userId, cur - (+amount || 0));
+}
+
 export default class Bot {
   constructor(token) {
     this.bot = new TelegramBot(token, { polling: false });
@@ -81,8 +103,13 @@ export default class Bot {
       /^\/vin(?:@[\w_]+)?\s+([A-HJ-NPR-Z0-9]{8,})(?:\s+(\S+))?/i,
       (m, mm) => this.handleVin(m, mm[1], mm[2] || process.env.DEFAULT_LOCALE || 'ru_RU')
     );
-    this.bot.onText(/^\/gpt(?:@[\\w_]+)?\\s*(.*)$/is, (m, mm) => this.handleGpt(m, mm[1]));
-    this.bot.onText(/^\/reset\b/i, (m) => this.onReset(m));   // ← метод есть ниже!
+    this.bot.onText(/^\/gpt(?:@[\w_]+)?\s*(.*)$/is, (m, mm) => this.handleGpt(m, mm[1]));
+    this.bot.onText(/^\/reset\b/i, (m) => this.onReset(m));
+
+    // Баланс — показать/пополнить/списать
+    this.bot.onText(/^\/balance\b/i, (m) => this.onBalance(m));
+    this.bot.onText(/^\/topup\s+(-?\d+(?:\.\d+)?)$/i, (m, mm) => this.onTopUp(m, mm[1]));
+    this.bot.onText(/^\/charge\s+(-?\d+(?:\.\d+)?)$/i, (m, mm) => this.onCharge(m, mm[1]));
 
     // Свободные сообщения — сначала проверим кнопки/вин, иначе GPT
     this.bot.on('message', (m) => this.onMessage(m));
@@ -97,11 +124,12 @@ export default class Bot {
   async setMenuCommands() {
     await this.bot.setMyCommands(
       [
-        { command: 'vin',   description: 'Подбор по VIN' },
-        { command: 'gpt',   description: 'GPT-чат: спросить ИИ' },
-        { command: 'reset', description: 'Сбросить контекст GPT' },
-        { command: 'help',  description: 'Как пользоваться' },
-        { command: 'menu',  description: 'Показать кнопки меню' }
+        { command: 'vin',     description: 'Подбор по VIN' },
+        { command: 'gpt',     description: 'GPT-чат: спросить ИИ' },
+        { command: 'balance', description: 'Показать баланс' },
+        { command: 'reset',   description: 'Сбросить контекст GPT' },
+        { command: 'help',    description: 'Как пользоваться' },
+        { command: 'menu',    description: 'Показать кнопки меню' }
       ],
       { scope: { type: 'default' }, language_code: '' }
     );
@@ -116,16 +144,24 @@ export default class Bot {
 
   // ───────────────────────── UI ─────────────────────────
   async onStart(msg) {
+    const userId = msg.from?.id;
+    const balance = fmtMoney(getBalance(userId));
+
     const text = [
-  '👋 <b>Привет!</b> Я помогу тебе работать с VIN и общаться с GPT-5.',
-  '',
-  '✨ Вот что я умею:',
-  '• 🔎 <b>Подбор по VIN</b> — команда <code>/vin WAUZZZ...</code> или просто кнопка ниже.',
-  '• 🤖 <b>GPT-чат</b> — спроси что угодно через <code>/gpt &lt;вопрос&gt;</code> или кнопку ниже.',
-  '• ♻️ <b>Сбросить контекст GPT</b> — команда <code>/reset</code>, если ответы сбились.',
-  '',
-  '💡 <i>Подсказка:</i> просто пришли VIN прямо в чат — и я сам его распознаю.'
-].join('\n');
+      '👋 <b>Привет!</b> Я помогу тебе работать с VIN и общаться с GPT-5.',
+      '',
+      `🧑‍💻 <b>ID:</b> <code>${escapeHtml(String(userId))}</code>`,
+      `💳 <b>Баланс:</b> <code>${escapeHtml(balance)}</code>`,
+      '',
+      '✨ Вот что я умею:',
+      '• 🔎 <b>Подбор по VIN</b> — <code>/vin WAUZZZ...</code> или кнопка ниже.',
+      '• 🤖 <b>GPT-чат</b> — спроси что угодно через <code>/gpt &lt;вопрос&gt;</code> или кнопку ниже.',
+      '• ♻️ <b>Сбросить контекст GPT</b> — команда <code>/reset</code>.',
+      '',
+      '💡 <i>Подсказка:</i> просто пришли VIN прямо в чат — и я сам его распознаю.',
+      '',
+      '🛠️ Пополнение/списание (для теста): <code>/topup 100</code>, <code>/charge 50</code>'
+    ].join('\n');
 
     await this.bot.sendMessage(msg.chat.id, text, {
       parse_mode: 'HTML',
@@ -134,7 +170,52 @@ export default class Bot {
   }
   async onHelp(msg) { return this.onStart(msg); }
   async onMenu(msg) {
-    await this.bot.sendMessage(msg.chat.id, 'Меню показано ✅', { reply_markup: homeKeyboard() });
+    const userId = msg.from?.id;
+    const balance = fmtMoney(getBalance(userId));
+    await this.bot.sendMessage(
+      msg.chat.id,
+      `Кнопки меню показаны ✅\n<b>ID:</b> <code>${escapeHtml(String(userId))}</code>\n<b>Баланс:</b> <code>${escapeHtml(balance)}</code>`,
+      { parse_mode: 'HTML', reply_markup: homeKeyboard() }
+    );
+  }
+
+  // ───────────────────── Баланс ─────────────────────
+  async onBalance(msg) {
+    const userId = msg.from?.id;
+    const balance = fmtMoney(getBalance(userId));
+    await this.bot.sendMessage(
+      msg.chat.id,
+      `💳 <b>Ваш баланс:</b> <code>${escapeHtml(balance)}</code>\n🧑‍💻 <b>ID:</b> <code>${escapeHtml(String(userId))}</code>`,
+      { parse_mode: 'HTML', reply_markup: homeKeyboard() }
+    );
+  }
+  async onTopUp(msg, amountStr) {
+    const userId = msg.from?.id;
+    const amount = parseFloat(amountStr);
+    if (!Number.isFinite(amount)) {
+      return this.bot.sendMessage(msg.chat.id, 'Введите сумму: <code>/topup 100</code>', { parse_mode: 'HTML' });
+    }
+    addBalance(userId, amount);
+    const balance = fmtMoney(getBalance(userId));
+    await this.bot.sendMessage(
+      msg.chat.id,
+      `✅ Пополнено на <code>${escapeHtml(fmtMoney(amount))}</code>\n💳 Новый баланс: <code>${escapeHtml(balance)}</code>`,
+      { parse_mode: 'HTML', reply_markup: homeKeyboard() }
+    );
+  }
+  async onCharge(msg, amountStr) {
+    const userId = msg.from?.id;
+    const amount = parseFloat(amountStr);
+    if (!Number.isFinite(amount)) {
+      return this.bot.sendMessage(msg.chat.id, 'Введите сумму: <code>/charge 50</code>', { parse_mode: 'HTML' });
+    }
+    chargeBalance(userId, amount);
+    const balance = fmtMoney(getBalance(userId));
+    await this.bot.sendMessage(
+      msg.chat.id,
+      `✅ Списано <code>${escapeHtml(fmtMoney(amount))}</code>\n💳 Новый баланс: <code>${escapeHtml(balance)}</code>`,
+      { parse_mode: 'HTML', reply_markup: homeKeyboard() }
+    );
   }
 
   // ───────────────────── Сообщения ─────────────────────
@@ -156,6 +237,9 @@ export default class Bot {
         'Спросите что-нибудь: <code>/gpt Чем GPT-5 отличается?</code>',
         { parse_mode: 'HTML' }
       );
+    }
+    if (text === '💳 Баланс') {
+      return this.onBalance(msg);
     }
     if (text === '♻️ Сброс GPT контекста') {
       return this.onReset(msg);
@@ -181,7 +265,14 @@ export default class Bot {
     try {
       const json = await getByVin(vin, locale);
 
-      const header = `Запрос по VIN <b>${escapeHtml(maskVin(vin))}</b> — locale: <b>${escapeHtml(locale)}</b>`;
+      const userId = msg.from?.id;
+      const balance = fmtMoney(getBalance(userId));
+
+      const header = [
+        `Запрос по VIN <b>${escapeHtml(maskVin(vin))}</b> — locale: <b>${escapeHtml(locale)}</b>`,
+        `🧑‍💻 ID: <code>${escapeHtml(String(userId))}</code> • 💳 Баланс: <code>${escapeHtml(balance)}</code>`
+      ].join('\n');
+
       const { html, tech } = formatVinCardHtml(json);
 
       // компактый payload для кнопок
