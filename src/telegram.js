@@ -76,7 +76,7 @@ export default class Bot {
       const json = await getByVin(vin, locale);
 
       const summary = summarizeVinResponse(json);
-      const header = `Запрос по VIN *${escapeMd(maskVin(vin))}* (locale: \`${escapeMd(locale)}\`)`;
+      const header = `Запрос по VIN *${escapeMd(maskVin(vin))}* — locale: *${escapeMd(locale)}*`;
       const md = [header, '', summary].join('\n');
 
       for (const part of chunk(md)) {
