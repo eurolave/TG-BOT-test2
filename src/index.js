@@ -15,7 +15,6 @@ await bot.setMenuCommands();
 if (useWebhook) {
   const port = Number(process.env.PORT || 3000);
   const publicUrl = ensure(process.env.WEBHOOK_PUBLIC_URL, 'WEBHOOK_PUBLIC_URL is required for webhook');
-
   await bot.setWebhook(`${publicUrl}/bot-webhook`);
 
   createServer((req, res) => {
@@ -30,6 +29,8 @@ if (useWebhook) {
     }
     res.writeHead(200).end('OK');
   }).listen(port, () => console.log(`[bot] webhook listening :${port}`));
+
+  console.log(`[bot] webhook mode at ${publicUrl}/bot-webhook`);
 } else {
   await bot.startPolling();
   console.log('[bot] long polling started');
