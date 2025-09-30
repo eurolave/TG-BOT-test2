@@ -25,8 +25,8 @@ function homeKeyboard() {
  * Храним payload в памяти и передаём только короткий токен.
  */
 const cbStore = new Map(); // token -> { action, data, ts }
-const CB_TTL_MS = 10 * 60 * 1000; // 10 минут живёт токен
-const CB_MAX = 5000; // ограничим рост памяти
+const CB_TTL_MS = 10 * 60 * 1000; // 10 минут
+const CB_MAX = 5000; // лимит записей
 
 function gcCbStore() {
   const now = Date.now();
@@ -34,35 +34,24 @@ function gcCbStore() {
     if (now - v.ts > CB_TTL_MS) cbStore.delete(k);
   }
   if (cbStore.size > CB_MAX) {
-    // удалить самые старые
     const arr = [...cbStore.entries()].sort((a, b) => a[1].ts - b[1].ts);
     const toDel = arr.slice(0, cbStore.size - CB_MAX);
     for (const [k] of toDel) cbStore.delete(k);
   }
 }
-
-function makeToken() {
-  // 12-символьный base36 токен
-  return Math.random().toString(36).slice(2, 14);
-}
-
-/** Сохраняем payload и возвращаем короткий callback_data */
+function makeToken() { return Math.random().toString(36).slice(2, 14); }
 function packCb(action, data) {
   gcCbStore();
   const token = makeToken();
   cbStore.set(token, { action, data, ts: Date.now() });
-  // Формат: "x:<token>" — коротко и стабильно < 64B
   return `x:${token}`;
 }
-
 function unpackCb(cbData) {
   if (!cbData || typeof cbData !== 'string') return null;
   const m = cbData.match(/^x:([a-z0-9]+)$/i);
   if (!m) return null;
-  const token = m[1];
-  const rec = cbStore.get(token);
-  if (!rec) return null;
-  return rec; // { action, data, ts }
+  const rec = cbStore.get(m[1]);
+  return rec || null;
 }
 
 /** Inline-клавиатура для карточки VIN (через токены) */
@@ -71,7 +60,6 @@ function vinInlineKeyboard(payload) {
   const btnUnits   = packCb('units',   payload);
   const btnDetails = packCb('details', payload);
   const btnRefresh = packCb('refresh', { vin: payload.vin, locale: payload.locale });
-
   return {
     inline_keyboard: [[
       { text: '🔩 Узлы',     callback_data: btnUnits },
@@ -93,8 +81,8 @@ export default class Bot {
       /^\/vin(?:@[\w_]+)?\s+([A-HJ-NPR-Z0-9]{8,})(?:\s+(\S+))?/i,
       (m, mm) => this.handleVin(m, mm[1], mm[2] || process.env.DEFAULT_LOCALE || 'ru_RU')
     );
-    this.bot.onText(/^\/gpt(?:@[\w_]+)?\s*(.*)$/is, (m, mm) => this.handleGpt(m, mm[1]));
-    this.bot.onText(/^\/reset\b/i, (m) => this.onReset(m));
+    this.bot.onText(/^\/gpt(?:@[\\w_]+)?\\s*(.*)$/is, (m, mm) => this.handleGpt(m, mm[1]));
+    this.bot.onText(/^\/reset\b/i, (m) => this.onReset(m));   // ← метод есть ниже!
 
     // Свободные сообщения — сначала проверим кнопки/вин, иначе GPT
     this.bot.on('message', (m) => this.onMessage(m));
@@ -193,13 +181,8 @@ export default class Bot {
       const header = `Запрос по VIN <b>${escapeHtml(maskVin(vin))}</b> — locale: <b>${escapeHtml(locale)}</b>`;
       const { html, tech } = formatVinCardHtml(json);
 
-      // Соберём payload для кнопок (без длинных строк в callback_data)
-      const payload = {
-        vin,
-        locale,
-        catalog: tech.catalog || '',
-        ssd: tech.ssd || ''
-      };
+      // компактый payload для кнопок
+      const payload = { vin, locale, catalog: tech.catalog || '', ssd: tech.ssd || '' };
       const inline = vinInlineKeyboard(payload);
 
       // Шапка + карточка (HTML), без отправки JSON-файла
@@ -209,7 +192,7 @@ export default class Bot {
         reply_markup: homeKeyboard()
       });
 
-      // Клавиатуру вешаем на первую часть карточки, остальным — без клавы
+      // Клавиатуру вешаем только на первую часть карточки
       let first = true;
       for (const part of chunk(html, 3500)) {
         await this.bot.sendMessage(chatId, part, {
@@ -236,9 +219,11 @@ export default class Bot {
       const chatId = q.message.chat.id;
       const rec = unpackCb(q.data);
       if (!rec) {
-        await this.bot.sendMessage(chatId,
+        await this.bot.sendMessage(
+          chatId,
           '⛔ Данные для кнопки устарели. Пожалуйста, повторите запрос VIN.',
-          { parse_mode: 'HTML' });
+          { parse_mode: 'HTML' }
+        );
         return this.safeAnswerCallback(q.id);
       }
 
@@ -295,6 +280,21 @@ export default class Bot {
       );
     } finally {
       await typing;
+    }
+  }
+
+  // ───────────────────────── RESET ─────────────────────────
+  async onReset(msg) {
+    try {
+      gptReset(msg.chat.id);
+      await this.bot.sendMessage(msg.chat.id, 'Контекст GPT очищен ✅', {
+        reply_markup: homeKeyboard()
+      });
+    } catch (e) {
+      await this.bot.sendMessage(msg.chat.id, `Ошибка при сбросе: ${escapeHtml(e.message || String(e))}`, {
+        parse_mode: 'HTML',
+        reply_markup: homeKeyboard()
+      });
     }
   }
 }
