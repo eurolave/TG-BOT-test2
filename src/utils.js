@@ -27,3 +27,9 @@ export function brandEmoji(brand){
   };
   return map[b] || '🚗';
 }
+
+/** Простейшее форматирование суммы (рубли по умолчанию) */
+export function fmtMoney(n, currency = '₽') {
+  const amount = Number.isFinite(+n) ? (+n).toFixed(2) : '0.00';
+  return `${amount} ${currency}`;
+}
