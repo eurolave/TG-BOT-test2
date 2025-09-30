@@ -4,6 +4,7 @@ import { getByVin } from './laximoClient.js';
 import { formatVinCardHtml } from './formatters.js';
 import { chunk, maskVin, escapeHtml, fmtMoney } from './utils.js';
 import { chat as gptChat, reset as gptReset } from './gpt.js';
+import { getBalance, setBalance, addBalance, chargeBalance } from './userStore.js';
 
 const VIN_RE = /\b([A-HJ-NPR-Z0-9]{8,})\b/i;
 
@@ -69,28 +70,6 @@ function vinInlineKeyboard(payload) {
   };
 }
 
-/** ─────────────── User balance store (in-memory) ───────────────
- * userId -> { balance: number, updatedAt: number }
- * Простая in-memory реализация. Для прод-хранения — Redis/DB.
- */
-const userStore = new Map();
-function getBalance(userId) {
-  const rec = userStore.get(userId) || { balance: 0, updatedAt: Date.now() };
-  userStore.set(userId, rec);
-  return rec.balance || 0;
-}
-function setBalance(userId, amount) {
-  userStore.set(userId, { balance: +amount || 0, updatedAt: Date.now() });
-}
-function addBalance(userId, amount) {
-  const cur = getBalance(userId);
-  setBalance(userId, cur + (+amount || 0));
-}
-function chargeBalance(userId, amount) {
-  const cur = getBalance(userId);
-  setBalance(userId, cur - (+amount || 0));
-}
-
 export default class Bot {
   constructor(token) {
     this.bot = new TelegramBot(token, { polling: false });
@@ -145,7 +124,7 @@ export default class Bot {
   // ───────────────────────── UI ─────────────────────────
   async onStart(msg) {
     const userId = msg.from?.id;
-    const balance = fmtMoney(getBalance(userId));
+    const balance = fmtMoney(await getBalance(userId));
 
     const text = [
       '👋 <b>Привет!</b> Я помогу тебе работать с VIN и общаться с GPT-5.',
@@ -171,7 +150,7 @@ export default class Bot {
   async onHelp(msg) { return this.onStart(msg); }
   async onMenu(msg) {
     const userId = msg.from?.id;
-    const balance = fmtMoney(getBalance(userId));
+    const balance = fmtMoney(await getBalance(userId));
     await this.bot.sendMessage(
       msg.chat.id,
       `Кнопки меню показаны ✅\n<b>ID:</b> <code>${escapeHtml(String(userId))}</code>\n<b>Баланс:</b> <code>${escapeHtml(balance)}</code>`,
@@ -182,7 +161,7 @@ export default class Bot {
   // ───────────────────── Баланс ─────────────────────
   async onBalance(msg) {
     const userId = msg.from?.id;
-    const balance = fmtMoney(getBalance(userId));
+    const balance = fmtMoney(await getBalance(userId));
     await this.bot.sendMessage(
       msg.chat.id,
       `💳 <b>Ваш баланс:</b> <code>${escapeHtml(balance)}</code>\n🧑‍💻 <b>ID:</b> <code>${escapeHtml(String(userId))}</code>`,
@@ -195,8 +174,8 @@ export default class Bot {
     if (!Number.isFinite(amount)) {
       return this.bot.sendMessage(msg.chat.id, 'Введите сумму: <code>/topup 100</code>', { parse_mode: 'HTML' });
     }
-    addBalance(userId, amount);
-    const balance = fmtMoney(getBalance(userId));
+    await addBalance(userId, amount);
+    const balance = fmtMoney(await getBalance(userId));
     await this.bot.sendMessage(
       msg.chat.id,
       `✅ Пополнено на <code>${escapeHtml(fmtMoney(amount))}</code>\n💳 Новый баланс: <code>${escapeHtml(balance)}</code>`,
@@ -209,8 +188,8 @@ export default class Bot {
     if (!Number.isFinite(amount)) {
       return this.bot.sendMessage(msg.chat.id, 'Введите сумму: <code>/charge 50</code>', { parse_mode: 'HTML' });
     }
-    chargeBalance(userId, amount);
-    const balance = fmtMoney(getBalance(userId));
+    await chargeBalance(userId, amount);
+    const balance = fmtMoney(await getBalance(userId));
     await this.bot.sendMessage(
       msg.chat.id,
       `✅ Списано <code>${escapeHtml(fmtMoney(amount))}</code>\n💳 Новый баланс: <code>${escapeHtml(balance)}</code>`,
@@ -259,14 +238,14 @@ export default class Bot {
   }
 
   // ───────────────────────── VIN ─────────────────────────
-  async handleVin(msg, vin, locale = 'ru_RU') {
+  async handleVin(msg, vin, locale = 'ru_RU', opts = {}) {
     const chatId = msg.chat.id;
     const typing = this.bot.sendChatAction(chatId, 'typing').catch(() => {});
     try {
-      const json = await getByVin(vin, locale);
+      const json = await getByVin(vin, locale, opts);
 
       const userId = msg.from?.id;
-      const balance = fmtMoney(getBalance(userId));
+      const balance = fmtMoney(await getBalance(userId));
 
       const header = [
         `Запрос по VIN <b>${escapeHtml(maskVin(vin))}</b> — locale: <b>${escapeHtml(locale)}</b>`,
@@ -324,7 +303,7 @@ export default class Bot {
       const { action, data } = rec;
 
       if (action === 'refresh') {
-        await this.handleVin(q.message, data.vin, data.locale);
+        await this.handleVin(q.message, data.vin, data.locale, { force: true });
         return this.safeAnswerCallback(q.id);
       }
 
