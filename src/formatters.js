@@ -1,30 +1,81 @@
-import { escapeMd } from './utils.js';
+import { escapeHtml, detectLangFromLocale, brandEmoji } from './utils.js';
 
-export function summarizeVinResponse(json) {
-  const data = json?.data ?? json;
-  const flat = [];
+/**
+ * HTML-карточка VIN (локализация ru/en, эмодзи брендов)
+ * Ожидаемый формат:
+ * { ok: true, data: [ { vehicles: [ { brand, name, attributes:{...}, catalog, ssd } ] } ], vin, locale }
+ */
+export function formatVinCardHtml(json) {
+  const root = json?.data ?? json;
+  const vin  = json?.vin || '';
+  const locale = json?.locale || 'ru_RU';
+  const lang = detectLangFromLocale(locale);
 
-  const pickScalars = (obj, prefix='') => {
-    for (const [k, v] of Object.entries(obj || {})) {
-      if (v == null) continue;
-      const key = prefix ? `${prefix}.${k}` : k;
-      if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-        flat.push([key, v]);
-      } else if (typeof v === 'object' && !Array.isArray(v)) {
-        pickScalars(v, key);
-      }
+  const vehicles = Array.isArray(root) ? root[0]?.vehicles : root?.vehicles;
+  const v = Array.isArray(vehicles) ? vehicles[0] : null;
+
+  const A = v?.attributes || {};
+  const getV = (k) => A?.[k]?.value ?? '';
+  const getN = (k, fallback) => A?.[k]?.name ?? fallback ?? k;
+
+  const brand = v?.brand || '';
+  const model = v?.name  || '';
+  const emoji = brandEmoji(brand);
+
+  const labels = {
+    ru: {
+      date: 'Дата выпуска',
+      manufactured: 'Выпущено',
+      prodrange: 'Период производства',
+      engine: 'Двигатель',
+      engine_info: 'Двигатель',
+      transmission: 'КПП',
+      framecolor: 'Цвет кузова',
+      trimcolor: 'Цвет салона'
+    },
+    en: {
+      date: 'Production date',
+      manufactured: 'Manufactured',
+      prodrange: 'Production range',
+      engine: 'Engine',
+      engine_info: 'Engine',
+      transmission: 'Transmission',
+      framecolor: 'Body color',
+      trimcolor: 'Interior color'
     }
+  }[lang];
+
+  const items = [
+    ['📅', labels.date,         getV('date')],
+    ['🏭', labels.manufactured, getV('manufactured')],
+    ['⏳', labels.prodrange,    getV('prodrange')],
+    ['⚙️', labels.engine,       getV('engine')],
+    ['🚗', labels.engine_info,  getV('engine_info')],
+    ['🔧', labels.transmission, getV('transmission')],
+    ['🎨', labels.framecolor,   getV('framecolor')],
+    ['🪑', labels.trimcolor,    getV('trimcolor')]
+  ].filter(([, , val]) => !!val);
+
+  const title =
+    `${emoji} <b>${escapeHtml(brand || '')} ${escapeHtml(model || '')}</b>`;
+
+  const metaLabel = lang === 'ru' ? 'Идентификатор' : 'Identifier';
+  const localeLabel = lang === 'ru' ? 'язык' : 'locale';
+
+  const subtitle =
+    `VIN: <b>${escapeHtml(vin)}</b> &nbsp;•&nbsp; ${escapeHtml(localeLabel)}: <b>${escapeHtml(locale)}</b>`;
+
+  const lines = items.map(([e, name, val]) =>
+    `${e} <b>${escapeHtml(name)}:</b> ${escapeHtml(String(val))}`);
+
+  // технические поля, чтобы кнопки могли работать в будущем
+  const tech = {
+    catalog: v?.catalog || '',
+    ssd: v?.ssd || ''
   };
 
-  if (Array.isArray(data)) { if (data[0]) pickScalars(data[0]); }
-  else if (data && typeof data === 'object') { pickScalars(data); }
-
-  const lines = [
-    `*VIN найден*`,
-    '',
-    ...flat.slice(0, 12).map(([k, v]) => `• *${escapeMd(k)}*: ${escapeMd(String(v))}`),
-    flat.length > 12 ? `… и ещё ${flat.length - 12} полей` : ''
-  ].filter(Boolean);
-
-  return lines.join('\n');
+  return {
+    html: [title, subtitle, '', ...lines].join('\n'),
+    tech
+  };
 }
