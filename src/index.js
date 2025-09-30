@@ -10,7 +10,7 @@ const useWebhook = !!argv.webhook;
 const token = ensure(process.env.TELEGRAM_TOKEN, 'TELEGRAM_TOKEN is required');
 const bot = new Bot(token);
 
-await bot.setMenuCommands(); // меню команд
+await bot.setMenuCommands();
 
 if (useWebhook) {
   const port = Number(process.env.PORT || 3000);
@@ -30,8 +30,6 @@ if (useWebhook) {
     }
     res.writeHead(200).end('OK');
   }).listen(port, () => console.log(`[bot] webhook listening :${port}`));
-
-  console.log(`[bot] webhook mode at ${publicUrl}/bot-webhook`);
 } else {
   await bot.startPolling();
   console.log('[bot] long polling started');
