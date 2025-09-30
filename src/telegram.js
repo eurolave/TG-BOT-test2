@@ -117,13 +117,16 @@ export default class Bot {
   // ───────────────────────── UI ─────────────────────────
   async onStart(msg) {
     const text = [
-      'Привет! Я умею:',
-      '• <b>Подбор по VIN</b> — <code>/vin WAUZZZ... [locale]</code> или кнопка ниже',
-      '• <b>GPT-чат</b> — <code>/gpt &lt;вопрос&gt;</code> или кнопка ниже',
-      '• Сброс контекста GPT: <code>/reset</code>',
-      '',
-      'Подсказка: просто пришлите VIN — я сам пойму.'
-    ].join('\n');
+  '👋 <b>Привет!</b> Я помогу тебе работать с VIN и общаться с GPT-5.',
+  '',
+  '✨ Вот что я умею:',
+  '• 🔎 <b>Подбор по VIN</b>',
+  '• 🤖 <b>GPT-чат</b>,
+  '• ♻️ <b>Сбросить контекст GPT</b>,
+  '',
+  '💡 <i>Подсказка:</i> просто пришли VIN прямо в чат — и я сам его распознаю.'
+].join('\n');
+
     await this.bot.sendMessage(msg.chat.id, text, {
       parse_mode: 'HTML',
       reply_markup: homeKeyboard()
