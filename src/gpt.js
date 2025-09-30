@@ -28,15 +28,15 @@ export async function chat(chatId, userText) {
     pushHistory(chatId, 'assistant', text);
     return text;
   } else {
-    const completion = await client.chat.completions.create({
-      model: MODEL,
-      messages: store.get(chatId),
-      temperature: 0.4
-    });
-    const text = completion.choices?.[0]?.message?.content || '…';
-    pushHistory(chatId, 'assistant', text);
-    return text;
-  }
+  // Chat Completions API — БЕЗ temperature, чтобы не падать на моделях, где она не поддерживается
+  const completion = await client.chat.completions.create({
+    model: MODEL,
+    messages: store.get(chatId)
+  });
+  const text = completion.choices?.[0]?.message?.content || '…';
+  pushHistory(chatId, 'assistant', text);
+  return text;
+}
 }
 
 export function reset(chatId) {
