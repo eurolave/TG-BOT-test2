@@ -156,3 +156,42 @@ const masked = (t) => (t ? t.slice(0, 9) + '...' + t.slice(-4) : '(empty)');
           Promise.resolve(bot.processUpdate(update)).catch((e) => {
             console.error('[webhook] process error:', e?.message || e);
           });
+        } catch (e) {
+          console.error('[webhook] parse error:', e?.message || e, 'body=', body?.slice(0, 200));
+        }
+      });
+
+      return;
+    }
+
+    // Fallback: health/info
+    return sendJSON(200, { ok: true, service: 'tg-bot' });
+  });
+
+  server.listen(port, () => {
+    console.log(`[bot] webhook listening :${port}`);
+    console.log('[bot] env →', {
+      TELEGRAM_TOKEN: masked(token),
+      WEBHOOK_PUBLIC_URL: publicUrl.replace(/\/+$/, ''),
+      WEBHOOK_SECRET_len: webhookSecret?.length || 0,
+      PORT: port,
+    });
+  });
+
+  // На вебхуке polling не нужен — на всякий случай повесим логгер,
+  // но запускать startPolling() НЕЛЬЗЯ.
+  bot.bot.on('polling_error', (e) => {
+    console.warn('[polling_error while in webhook mode]', e?.message || e);
+  });
+
+  // Корректное завершение
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    process.once(sig, async () => {
+      try { await bot.bot.stopPolling(); } catch {}
+      process.exit(0);
+    });
+  }
+})().catch((e) => {
+  console.error('[bot] fatal start error:', e?.message || e);
+  process.exit(1);
+});
