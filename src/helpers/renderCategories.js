@@ -1,89 +1,136 @@
-// src/helpers/renderCategories.js
+// helpers/renderCategories.js
 
-export function renderVehicleHeader(vehicle) {
-  const name = vehicle?.name || 'Автомобиль';
-  const brand = vehicle?.brand || '';
-  const attrs = vehicle?.attributes || {};
-  const date = attrs.date?.value || '';
-  const engine = attrs.engine?.value || '';
-  const engineInfo = attrs.engine_info?.value || '';
-  const transmission = attrs.transmission?.value || '';
+/**
+ * Формат "красивой шапки" по данным из /vin
+ * Ожидает структуру vehicle уровня:
+ * {
+ *   brand: 'AUDI',
+ *   name: 'Q7',
+ *   catalog: 'AU1587',
+ *   vehicleId: '0',
+ *   ssd: '...'
+ *   attributes: {
+ *     date: { name: 'Дата выпуска', value: '16.08.2017' },
+ *     manufactured: { name: 'Выпущено', value: '2018' },
+ *     prodrange: { name: 'Период производства', value: '2016 - 2026' },
+ *     market: { name: 'Рынок', value: 'Европа' },
+ *     engine: { name: 'Двигатель', value: 'CVMD' },
+ *     engine_info: { name: 'Двигатель', value: '3000CC / 249hp / 183kW TDI CR' },
+ *     engineno: { name: 'Номер двигателя', value: '16658' },
+ *     transmission: { name: 'КПП', value: 'SUQ(8A)' },
+ *     framecolor: { name: 'Цвет кузова', value: '2T2T' },
+ *     trimcolor: { name: 'Цвет салона', value: 'FZ' }
+ *   }
+ * }
+ */
+
+export function renderVehicleHeader(vehicle = {}) {
+  const { brand = '', name = '', catalog = '', vehicleId = '', ssd = '', attributes = {} } = vehicle || {};
+  const A = (k) => attributes?.[k]?.value || '';
+  const H = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const line = (label, value, emoji = '') => {
+    if (!value) return '';
+    return `${emoji ? emoji + ' ' : ''}<b>${H(label)}:</b> ${H(value)}\n`;
+  };
+
+  const title = [
+    brand || name ? `🚗 <b>${H(brand || '')} ${H(name || '')}</b>` : '🚗 <b>Автомобиль</b>',
+    catalog ? ` · <code>${H(catalog)}</code>` : '',
+  ].join('');
+
+  const info =
+    line('Рынок', A('market'), '🌍') +
+    line('Период производства', A('prodrange'), '📅') +
+    line('Дата выпуска', A('date'), '📆') +
+    line('Выпущено', A('manufactured'), '🏷️') +
+    line('Двигатель', [A('engine_info') || '', A('engine') ? `(${A('engine')})` : ''].filter(Boolean).join(' '), '🛠️') +
+    line('№ двигателя', A('engineno'), '🔢') +
+    line('КПП', A('transmission'), '⚙️') +
+    line('Цвет кузова', A('framecolor'), '🎨') +
+    line('Цвет салона', A('trimcolor'), '🧵');
+
+  // Техконтекст — полезно при отладке, но не мешаем пользователю
+  const tech = [
+    vehicleId ? `• vehicleId: <code>${H(vehicleId)}</code>` : '',
+    catalog ? `• catalog: <code>${H(catalog)}</code>` : '',
+    ssd ? `• ssd: <code>${H(ssd.slice(0, 16))}…</code>` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
 
   return [
-    `<b>${escapeHtml(name)} — ${escapeHtml(brand)}</b>`,
-    date ? `Дата выпуска: <b>${escapeHtml(date)}</b>` : null,
-    engine || engineInfo
-      ? `Двигатель: <b>${escapeHtml(engine)}</b>${engineInfo ? ` (${escapeHtml(engineInfo)})` : ''}`
-      : null,
-    transmission ? `КПП: <b>${escapeHtml(transmission)}</b>` : null,
-  ].filter(Boolean).join('\n');
+    title,
+    info ? '\n' + info.trim() : '',
+    tech ? '\n<code>' + tech + '</code>' : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+    .trim();
 }
 
+/**
+ * Рендер списка корневых категорий (инлайн-кнопки).
+ * Ожидает формат, который ты отдаёшь из /categories:
+ * data: [{ root: [ { id, name, children? }, ... ] }]
+ */
 export function renderCategoriesList(categoriesRoot) {
   const root = Array.isArray(categoriesRoot?.[0]?.root) ? categoriesRoot[0].root : [];
-  const lines = ['\n<b>Категории:</b>'];
   const buttons = [];
 
-  const icon = (name) => {
-    const n = (name || '').toLowerCase();
-    if (n.includes('двигател')) return '🔧';
-    if (n.includes('коробк')) return '🔁';
-    if (n.includes('тормоз') || n.includes('колёс') || n.includes('колес')) return '🛑';
-    if (n.includes('электро')) return '🔌';
-    if (n.includes('ось')) return '🛞';
-    if (n.includes('кузов')) return '🚪';
-    if (n.includes('педал') || n.includes('переключ')) return '🎛️';
-    if (n.includes('питани') || n.includes('охлажден') || n.includes('выпуск')) return '⚙️';
-    return '📦';
-  };
+  for (const cat of root) {
+    const text = truncate(cat?.name || 'Без названия', 48);
+    const id = String(cat?.id ?? '');
+    if (!id) continue;
+    buttons.push([{ text, callback_data: `cat:${id}` }]);
+  }
 
-  root.forEach((cat, idx) => {
-    const title = `${idx + 1}) ${icon(cat.name)} ${cat.name}`;
-    lines.push(escapeHtml(title));
-    buttons.push({ text: `${idx + 1}`, callback_data: `cat:${cat.categoryId}` });
-  });
-
-  const keyboard = [];
-  for (let i = 0; i < buttons.length; i += 5) {
-    keyboard.push(buttons.slice(i, i + 5));
+  // группируем по 2 в ряд (если хочется по 3 — поменяй chunkSize)
+  const chunkSize = 2;
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += chunkSize) {
+    const row = buttons.slice(i, i + chunkSize).map(([btn]) => btn);
+    rows.push(row);
   }
 
   return {
-    text: lines.join('\n'),
-    reply_markup: { inline_keyboard: keyboard },
+    text: '🗂️ <b>Категории</b>\nВыберите раздел:',
     parse_mode: 'HTML',
     disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: rows.length ? rows : [[{ text: 'Обновить', callback_data: 'noop:refresh' }]] },
   };
 }
 
-export function renderUnitsList(units) {
-  // units — массив узлов (после /units)
-  const list = Array.isArray(units) ? units : [];
-  const lines = ['<b>Узлы:</b>'];
-  const buttons = [];
-
-  list.forEach((u, idx) => {
-    const name = u.name || `Узел ${idx + 1}`;
-    const unitId = u.unitId || u.id || u.code || String(idx + 1);
-    lines.push(`${idx + 1}) ${escapeHtml(name)}`);
-    // Если планируешь проваливаться в детали, добавь callback_data: `unit:${unitId}`
-    // пока просто выводим список, без перехода
-    buttons.push({ text: `${idx + 1}`, callback_data: `noop:${unitId}` });
+/**
+ * Рендер списка узлов в выбранной категории
+ * Ожидает массив units: [ { unitId, name, ... }, ... ]
+ */
+export function renderUnitsList(units = []) {
+  const rows = [];
+  const buttons = units.map((u) => {
+    const text = truncate(u?.name || 'Без названия', 48);
+    const id = String(u?.unitId ?? '');
+    // Если нет unitId — делаем noop кнопку, чтобы пользователь видел элемент
+    const cb = id ? `unit:${id}` : 'noop:unit';
+    return { text, callback_data: cb };
   });
 
-  const keyboard = [];
-  for (let i = 0; i < buttons.length; i += 4) {
-    keyboard.push(buttons.slice(i, i + 4));
+  // по 2 в ряд
+  const chunkSize = 2;
+  for (let i = 0; i < buttons.length; i += chunkSize) {
+    rows.push(buttons.slice(i, i + chunkSize));
   }
 
   return {
-    text: lines.join('\n'),
-    reply_markup: { inline_keyboard: keyboard },
+    text: '🔧 <b>Узлы</b>\nВыберите узел для деталей/схем:',
     parse_mode: 'HTML',
     disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: rows.length ? rows : [[{ text: 'Назад', callback_data: 'noop:back' }]] },
   };
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+/* ───────────────────────── helpers ───────────────────────── */
+function truncate(s, n) {
+  const t = String(s || '');
+  return t.length > n ? t.slice(0, n - 1) + '…' : t;
 }
