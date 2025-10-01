@@ -36,6 +36,8 @@ function memGet(k) {
   return it.value;
 }
 
+/** ───────── High-level API для категорий/контекста ───────── */
+
 /** Сохраняем список категорий (categoryId+name+ssd) */
 export async function saveCategoriesSession(userId, catalog, vehicleId, rootArray, ttlSec = TTL_CATS) {
   const data = (Array.isArray(rootArray) ? rootArray : []).map(c => ({
@@ -76,4 +78,33 @@ export async function getUserVehicle(userId) {
   const r = await getRedis();
   const raw = r ? await r.get(key) : memGet(key);
   return raw ? JSON.parse(raw) : null;
+}
+
+/** ───────── Совместимость с существующим кодом: cacheGet/cacheSet ─────────
+ * Некоторые модули ожидают универсальные функции кэша.
+ * Эти шимирующие функции работают с JSON-значениями:
+ *  - cacheSet(key, value, ttlSec) — сериализует value в JSON
+ *  - cacheGet(key) — парсит JSON и возвращает объект/массив/скаляр
+ */
+
+export async function cacheSet(key, value, ttlSec = 900) {
+  const r = await getRedis();
+  const payload = JSON.stringify(value);
+  if (r) {
+    await r.set(key, payload, { EX: ttlSec });
+  } else {
+    memSet(key, payload, ttlSec);
+  }
+}
+
+export async function cacheGet(key) {
+  const r = await getRedis();
+  const raw = r ? await r.get(key) : memGet(key);
+  if (raw == null) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // если вдруг кто-то положил не-JSON — вернём сырой
+    return raw;
+  }
 }
