@@ -259,11 +259,11 @@ export default class Bot {
 
       
       // Кнопка «Перейти в каталог» (без лишнего текста)
-+      await this._safeSendMessage(chatId, '\u200B', {
-+        reply_markup: {
-+          inline_keyboard: [[{ text: '📂 Перейти в каталог', callback_data: 'cats' }]]
-+        }
-+      });
+      await this._safeSendMessage(chatId, '\u200B', {
+        reply_markup: {
+          inline_keyboard: [[{ text: '📂 Перейти в каталог', callback_data: 'cats' }]]
+        }
+      });
     } catch (e) {
       await this._safeSendMessage(
         chatId,
