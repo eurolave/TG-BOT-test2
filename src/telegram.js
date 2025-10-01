@@ -1,319 +1,192 @@
 // src/telegram.js
 import TelegramBot from 'node-telegram-bot-api';
-import { getByVin, getUnits } from './laximoClient.js';
-import { formatVinCardHtml, formatUnitsPage } from './formatters.js';
-import { chunk, maskVin, escapeHtml, fmtMoney } from './utils.js';
-import { chat as gptChat, reset as gptReset } from './gpt.js';
-import { getBalance, setBalance, addBalance, chargeBalance } from './userStore.js';
-
-const VIN_RE = /\b([A-HJ-NPR-Z0-9]{8,})\b/i;
-
-/** ReplyKeyboard под полем ввода */
-function homeKeyboard() {
-  return {
-    keyboard: [
-      [{ text: '🔎 Подбор по VIN' }, { text: '🤖 GPT-чат' }],
-      [{ text: '💳 Баланс' }, { text: '♻️ Сброс GPT контекста' }]
-    ],
-    resize_keyboard: true,
-    is_persistent: true
-  };
-}
-
-/** ── компактный callback store (токены ≤64B) ── */
-const cbStore = new Map(); // token -> { action, data, ts }
-const CB_TTL_MS = 10 * 60 * 1000;
-const CB_MAX = 5000;
-function gcCbStore() {
-  const now = Date.now();
-  for (const [k, v] of cbStore) if (now - v.ts > CB_TTL_MS) cbStore.delete(k);
-  if (cbStore.size > CB_MAX) {
-    const arr = [...cbStore.entries()].sort((a, b) => a[1].ts - b[1].ts);
-    for (const [k] of arr.slice(0, cbStore.size - CB_MAX)) cbStore.delete(k);
-  }
-}
-function makeToken() { return Math.random().toString(36).slice(2, 14); }
-function packCb(action, data) { gcCbStore(); const t = makeToken(); cbStore.set(t, { action, data, ts: Date.now() }); return `x:${t}`; }
-function unpackCb(s) { const m = /^x:([a-z0-9]+)$/i.exec(String(s||'')); return m ? cbStore.get(m[1]) || null : null; }
-
-/** Inline-клава карточки VIN */
-function vinInlineKeyboard(payload) {
-  const btnUnits   = packCb('units',   { ...payload, page: 0 });
-  const btnRefresh = packCb('refresh', { vin: payload.vin, locale: payload.locale });
-  return {
-    inline_keyboard: [[
-      { text: '🔩 Узлы',     callback_data: btnUnits },
-      { text: '🔁 Обновить', callback_data: btnRefresh }
-    ]]
-  };
-}
-
-/** Inline-клава списка узлов c пагинацией */
-function unitsInlineKeyboard(payload) {
-  // payload: { vin, locale, catalog, ssd, page, perPage, total }
-  const prev = Math.max(0, (payload.page || 0) - 1);
-  const next = Math.min(Math.ceil((payload.total || 0) / (payload.perPage || 10)) - 1, (payload.page || 0) + 1);
-
-  const prevBtn = packCb('units_page', { ...payload, page: prev });
-  const nextBtn = packCb('units_page', { ...payload, page: next });
-  const backBtn = packCb('vin_back',   { vin: payload.vin, locale: payload.locale });
-
-  return {
-    inline_keyboard: [[
-      { text: '⬅️ Назад', callback_data: prevBtn },
-      { text: '➡️ Далее', callback_data: nextBtn },
-    ], [
-      { text: '🔙 К VIN', callback_data: backBtn }
-    ]]
-  };
-}
+import fetch from 'node-fetch';
+import { renderVehicleHeader, renderCategoriesList, renderUnitsList } from './helpers/renderCategories.js';
+import { saveCategoriesSession, getCategorySsd, setUserVehicle, getUserVehicle } from './cache.js';
 
 export default class Bot {
   constructor(token) {
-    this.bot = new TelegramBot(token, { polling: false });
-
-    // Команды
-    this.bot.onText(/^\/start\b/i, (m) => this.onStart(m));
-    this.bot.onText(/^\/help\b/i,  (m) => this.onHelp(m));
-    this.bot.onText(/^\/menu\b/i,  (m) => this.onMenu(m));
-    this.bot.onText(
-      /^\/vin(?:@[\w_]+)?\s+([A-HJ-NPR-Z0-9]{8,})(?:\s+(\S+))?/i,
-      (m, mm) => this.handleVin(m, mm[1], mm[2] || process.env.DEFAULT_LOCALE || 'ru_RU')
-    );
-    this.bot.onText(/^\/gpt(?:@[\w_]+)?\s*(.*)$/is, (m, mm) => this.handleGpt(m, mm[1]));
-    this.bot.onText(/^\/reset\b/i, (m) => this.onReset(m));
-
-    // Баланс
-    this.bot.onText(/^\/balance\b/i, (m) => this.onBalance(m));
-    this.bot.onText(/^\/topup\s+(-?\d+(?:\.\d+)?)$/i, (m, mm) => this.onTopUp(m, mm[1]));
-    this.bot.onText(/^\/charge\s+(-?\d+(?:\.\d+)?)$/i, (m, mm) => this.onCharge(m, mm[1]));
-
-    // Сообщения
-    this.bot.on('message', (m) => this.onMessage(m));
-
-    // Callback
-    this.bot.on('callback_query', (q) => this.onCallback(q));
-
-    this.bot.on('polling_error', (e) => console.error('[polling_error]', e));
-    this.bot.on('webhook_error',  (e) => console.error('[webhook_error]', e));
+    this.bot = new TelegramBot(token, { polling: false, webHook: false });
+    this.name = 'LaximoBot';
   }
 
   async setMenuCommands() {
-    await this.bot.setMyCommands(
-      [
-        { command: 'vin',     description: 'Подбор по VIN' },
-        { command: 'gpt',     description: 'GPT-чат: спросить ИИ' },
-        { command: 'balance', description: 'Показать баланс' },
-        { command: 'reset',   description: 'Сбросить контекст GPT' },
-        { command: 'help',    description: 'Как пользоваться' },
-        { command: 'menu',    description: 'Показать кнопки меню' }
-      ],
-      { scope: { type: 'default' }, language_code: '' }
-    );
+    await this.bot.setMyCommands([
+      { command: 'start', description: 'Начало' },
+      { command: 'vin',   description: 'Подбор по VIN' },
+      { command: 'gpt',   description: 'GPT-чат' },
+      { command: 'reset', description: 'Сброс контекста GPT' },
+    ]);
   }
 
-  async startPolling() { this.bot.options.polling = { interval: 800, params: { timeout: 30 } }; await this.bot.startPolling(); }
-  async setWebhook(url) { await this.bot.setWebHook(url); }
-  processUpdate(update) { this.bot.processUpdate(update); }
-
-  // UI
-  async onStart(msg) {
-    const userId = msg.from?.id;
-    const balance = fmtMoney(await getBalance(userId));
-    const text = [
-      '👋 <b>Привет!</b> Я помогу тебе работать с VIN и общаться с GPT-5.',
-      '',
-      `🧑‍💻 <b>ID:</b> <code>${escapeHtml(String(userId))}</code>`,
-      `💳 <b>Баланс:</b> <code>${escapeHtml(balance)}</code>`,
-      '',
-      '✨ Вот что я умею:',
-      '• 🔎 <b>Подбор по VIN</b> — <code>/vin WAUZZZ...</code> или кнопка ниже.',
-      '• 🤖 <b>GPT-чат</b> — <code>/gpt &lt;вопрос&gt;</code> или кнопка ниже.',
-      '• ♻️ <b>Сбросить контекст</b> — <code>/reset</code>.',
-      '',
-      '💡 Просто пришли VIN в чат — я сам его распознаю.'
-    ].join('\n');
-    await this.bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
-  }
-  async onHelp(msg) { return this.onStart(msg); }
-  async onMenu(msg) {
-    const userId = msg.from?.id;
-    const balance = fmtMoney(await getBalance(userId));
-    await this.bot.sendMessage(
-      msg.chat.id,
-      `Кнопки меню показаны ✅\n<b>ID:</b> <code>${escapeHtml(String(userId))}</code>\n<b>Баланс:</b> <code>${escapeHtml(balance)}</code>`,
-      { parse_mode: 'HTML', reply_markup: homeKeyboard() }
-    );
+  async startPolling() {
+    await this.bot.startPolling({ interval: 800, params: { timeout: 30 } });
+    this._wireHandlers();
   }
 
-  // Баланс
-  async onBalance(msg) {
-    const userId = msg.from?.id;
-    const balance = fmtMoney(await getBalance(userId));
-    await this.bot.sendMessage(
-      msg.chat.id,
-      `💳 <b>Ваш баланс:</b> <code>${escapeHtml(balance)}</code>\n🧑‍💻 <b>ID:</b> <code>${escapeHtml(String(userId))}</code>`,
-      { parse_mode: 'HTML', reply_markup: homeKeyboard() }
-    );
-  }
-  async onTopUp(msg, amountStr) {
-    const userId = msg.from?.id;
-    const amount = parseFloat(amountStr);
-    if (!Number.isFinite(amount)) {
-      return this.bot.sendMessage(msg.chat.id, 'Введите сумму: <code>/topup 100</code>', { parse_mode: 'HTML' });
-    }
-    await addBalance(userId, amount);
-    const balance = fmtMoney(await getBalance(userId));
-    await this.bot.sendMessage(msg.chat.id, `✅ Пополнено на <code>${escapeHtml(balance)}</code>`, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
-  }
-  async onCharge(msg, amountStr) {
-    const userId = msg.from?.id;
-    const amount = parseFloat(amountStr);
-    if (!Number.isFinite(amount)) {
-      return this.bot.sendMessage(msg.chat.id, 'Введите сумму: <code>/charge 50</code>', { parse_mode: 'HTML' });
-    }
-    await chargeBalance(userId, amount);
-    const balance = fmtMoney(await getBalance(userId));
-    await this.bot.sendMessage(msg.chat.id, `✅ Списано. Баланс: <code>${escapeHtml(balance)}</code>`, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
+  processUpdate(update) {
+    this.bot.processUpdate(update);
   }
 
-  // Сообщения
-  async onMessage(msg) {
-    const text = (msg.text || '').trim();
-    if (!text) return;
-
-    if (text === '🔎 Подбор по VIN') {
-      return this.bot.sendMessage(msg.chat.id, 'Пришлите VIN или используйте команду:\n<code>/vin WAUZZZ... [locale]</code>', { parse_mode: 'HTML' });
-    }
-    if (text === '🤖 GPT-чат') {
-      return this.bot.sendMessage(msg.chat.id, 'Спросите что-нибудь: <code>/gpt Чем GPT-5 отличается?</code>', { parse_mode: 'HTML' });
-    }
-    if (text === '💳 Баланс')  return this.onBalance(msg);
-    if (text === '♻️ Сброс GPT контекста') return this.onReset(msg);
-
-    const vinMatch = text.match(VIN_RE);
-    if (vinMatch && !text.startsWith('/')) {
-      return this.handleVin(msg, vinMatch[1], process.env.DEFAULT_LOCALE || 'ru_RU');
-    }
-    if (!text.startsWith('/')) return this.handleGpt(msg, text);
-  }
-
-  // VIN
-  async handleVin(msg, vin, locale = 'ru_RU', opts = {}) {
-    const chatId = msg.chat.id;
-    const typing = this.bot.sendChatAction(chatId, 'typing').catch(() => {});
-    try {
-      const json = await getByVin(vin, locale, opts);
-      const userId = msg.from?.id;
-      const balance = fmtMoney(await getBalance(userId));
-
-      const header = [
-        `Запрос по VIN <b>${escapeHtml(maskVin(vin))}</b> — locale: <b>${escapeHtml(locale)}</b>`,
-        `🧑‍💻 ID: <code>${escapeHtml(String(userId))}</code> • 💳 Баланс: <code>${escapeHtml(balance)}</code>`
+  _wireHandlers() {
+    this.bot.onText(/^\/start\b/, async (msg) => {
+      const chatId = msg.chat.id;
+      const text = [
+        '<b>Привет!</b> Я помогу с подбором деталей по VIN и покажу дерево узлов.',
+        '• Подбор по VIN — <code>/vin WAUZZZ... [locale]</code>',
+        '• GPT-чат — <code>/gpt &lt;вопрос&gt;</code>',
+        '• Сброс контекста GPT — <code>/reset</code>',
+        '',
+        'Подсказка: просто пришлите VIN — я сам пойму 😉'
       ].join('\n');
+      await this.bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
+    });
 
-      const { html, tech } = formatVinCardHtml(json);
-      const payload = { vin, locale, catalog: tech.catalog || '', ssd: tech.ssd || '' };
-      const inline = vinInlineKeyboard(payload);
+    // /vin WAUZZZ... [locale]
+    this.bot.onText(/^\/vin\s+([A-Za-z0-9]{5,})\s*([A-Za-z_]{2,5}_[A-Za-z]{2})?/, async (msg, m) => {
+      const chatId = msg.chat.id;
+      const vin = (m[1] || '').trim();
+      const locale = (m[2] || process.env.DEFAULT_LOCALE || 'ru_RU').trim();
+      await this._handleVin(chatId, msg.from.id, vin, locale);
+    });
 
-      await this.bot.sendMessage(chatId, header, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: homeKeyboard() });
-
-      let first = true;
-      for (const part of chunk(html, 3500)) {
-        await this.bot.sendMessage(chatId, part, {
-          parse_mode: 'HTML',
-          disable_web_page_preview: true,
-          reply_markup: first ? inline : undefined
-        });
-        first = false;
+    // Просто VIN без команды
+    this.bot.on('message', async (msg) => {
+      if (!msg.text) return;
+      const chatId = msg.chat.id;
+      const t = msg.text.trim();
+      if (/^[A-Za-z0-9]{10,}$/.test(t) && !/^\/(vin|gpt|reset|start)/.test(t)) {
+        const locale = process.env.DEFAULT_LOCALE || 'ru_RU';
+        await this._handleVin(chatId, msg.from.id, t, locale);
       }
-    } catch (e) {
-      await this.bot.sendMessage(chatId, `Не удалось получить данные по VIN: ${escapeHtml(e.message || String(e))}`, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
-    } finally { await typing; }
+    });
+
+    // Callback: выбор категории
+    this.bot.on('callback_query', async (q) => {
+      const data = q.data || '';
+      if (data.startsWith('cat:')) {
+        const categoryId = data.split(':')[1];
+        await this._handleCategory(q, categoryId);
+        return;
+      }
+      if (data.startsWith('noop:')) {
+        // просто скрыть лоадер
+        await this.bot.answerCallbackQuery(q.id);
+      }
+    });
   }
 
-  // CALLBACKS
-  async onCallback(q) {
+  async _handleVin(chatId, userId, vin, locale) {
+    const base = (process.env.LAXIMO_BASE_URL || '').replace(/\/+$/, '');
+    if (!base) {
+      await this.bot.sendMessage(chatId, 'Не настроен LAXIMO_BASE_URL', { parse_mode: 'HTML' });
+      return;
+    }
+
+    const url = new URL(base + '/vin');
+    url.searchParams.set('vin', vin);
+    url.searchParams.set('locale', locale);
+
     try {
-      const chatId = q.message.chat.id;
-      const rec = unpackCb(q.data);
-      if (!rec) {
-        await this.bot.sendMessage(chatId, '⛔ Данные для кнопки устарели. Повторите запрос VIN.', { parse_mode: 'HTML' });
-        return this.safeAnswerCallback(q.id);
+      await this.bot.sendChatAction(chatId, 'typing');
+      const r = await fetch(url.toString());
+      const j = await r.json();
+
+      if (!j.ok) {
+        throw new Error(j.error || 'VIN не найден');
       }
 
-      const { action, data } = rec;
-
-      if (action === 'refresh') {
-        await this.handleVin(q.message, data.vin, data.locale, { force: true });
-        return this.safeAnswerCallback(q.id);
+      const vehicle = j.data?.[0]?.vehicles?.[0];
+      if (!vehicle) {
+        throw new Error('В ответе нет данных автомобиля');
       }
 
-      if (action === 'vin_back') {
-        await this.handleVin(q.message, data.vin, data.locale);
-        return this.safeAnswerCallback(q.id);
-      }
+      // Шапка
+      const header = renderVehicleHeader(vehicle);
+      await this.bot.sendMessage(chatId, header, { parse_mode: 'HTML' });
 
-      if (action === 'units' || action === 'units_page') {
-        const { vin, locale, catalog, ssd } = data;
-        const page = Math.max(0, data.page || 0);
-        const perPage = 10;
+      // Контекст пользователя (для следующих шагов)
+      const catalog = vehicle.catalog;
+      const vehicleId = vehicle.vehicleId || '0';
+      await setUserVehicle(userId, { catalog, vehicleId });
 
-        // грузим список узлов (из кэша/REST)
-        let unitsResp;
-        try {
-          unitsResp = await getUnits(catalog, ssd, locale);
-        } catch (e) {
-          await this.bot.sendMessage(chatId, `Не удалось получить узлы: ${escapeHtml(e.message || String(e))}`, { parse_mode: 'HTML' });
-          return this.safeAnswerCallback(q.id);
-        }
+      // Категории
+      const cUrl = new URL(base + '/categories');
+      cUrl.searchParams.set('catalog', catalog);
+      cUrl.searchParams.set('vehicleId', vehicleId);
+      cUrl.searchParams.set('ssd', vehicle.ssd);
 
-        const units = Array.isArray(unitsResp?.data) ? unitsResp.data : [];
-        const total = units.length;
+      const cRes = await fetch(cUrl.toString());
+      const cJson = await cRes.json();
+      if (!cJson.ok) throw new Error(cJson.error || 'Не удалось получить категории');
 
-        if (total === 0) {
-          await this.bot.sendMessage(chatId, 'Узлы не найдены для данного VIN.', { parse_mode: 'HTML' });
-          return this.safeAnswerCallback(q.id);
-        }
+      const categoriesRoot = cJson.data;
+      const root = Array.isArray(categoriesRoot?.[0]?.root) ? categoriesRoot[0].root : [];
+      await saveCategoriesSession(userId, catalog, vehicleId, root);
 
-        const html = formatUnitsPage(units, page, perPage, locale);
-        const kb = unitsInlineKeyboard({ vin, locale, catalog, ssd, page, perPage, total });
-
-        await this.bot.sendMessage(chatId, html, { parse_mode: 'HTML', reply_markup: kb });
-        return this.safeAnswerCallback(q.id);
-      }
-
-      // по умолчанию
-      await this.safeAnswerCallback(q.id);
+      const msg = renderCategoriesList(categoriesRoot);
+      await this.bot.sendMessage(chatId, msg.text, {
+        parse_mode: msg.parse_mode,
+        reply_markup: msg.reply_markup,
+        disable_web_page_preview: msg.disable_web_page_preview,
+      });
     } catch (e) {
-      console.error('[callback_error]', e);
-      try { await this.safeAnswerCallback(q.id); } catch {}
+      await this.bot.sendMessage(chatId,
+        `Не удалось получить данные по VIN: <code>${escapeHtml(String(e?.message || e))}</code>`,
+        { parse_mode: 'HTML' }
+      );
     }
   }
 
-  safeAnswerCallback(id) { return this.bot.answerCallbackQuery(id).catch(() => {}); }
+  async _handleCategory(q, categoryId) {
+    const chatId = q.message?.chat?.id;
+    const userId = q.from?.id;
+    if (!chatId || !userId) {
+      await this.bot.answerCallbackQuery(q.id);
+      return;
+    }
 
-  // GPT
-  async handleGpt(msg, promptText) {
-    const chatId = msg.chat.id;
-    const typing = this.bot.sendChatAction(chatId, 'typing').catch(() => {});
     try {
-      const answer = await gptChat(chatId, promptText || 'Привет!');
-      for (const part of chunk(answer)) {
-        await this.bot.sendMessage(chatId, part, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: homeKeyboard() });
-      }
-    } catch (e) {
-      await this.bot.sendMessage(chatId, `GPT ошибка: ${escapeHtml(e.message || String(e))}`, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
-    } finally { await typing; }
-  }
+      await this.bot.answerCallbackQuery(q.id, { text: 'Загружаю узлы…' });
 
-  // RESET
-  async onReset(msg) {
-    try {
-      gptReset(msg.chat.id);
-      await this.bot.sendMessage(msg.chat.id, 'Контекст GPT очищен ✅', { reply_markup: homeKeyboard() });
+      const ctx = await getUserVehicle(userId);
+      if (!ctx?.catalog) throw new Error('Контекст автомобиля не найден. Повтори VIN.');
+
+      const { catalog, vehicleId } = ctx;
+      const ssd = await getCategorySsd(userId, catalog, vehicleId || '0', categoryId);
+      if (!ssd) throw new Error('Сессия категорий устарела. Повтори VIN.');
+
+      const base = (process.env.LAXIMO_BASE_URL || '').replace(/\/+$/, '');
+      const uUrl = new URL(base + '/units');
+      uUrl.searchParams.set('catalog', catalog);
+      uUrl.searchParams.set('vehicleId', vehicleId || '0');
+      uUrl.searchParams.set('ssd', ssd);
+      uUrl.searchParams.set('categoryId', String(categoryId));
+
+      const uRes = await fetch(uUrl.toString());
+      const uJson = await uRes.json();
+      if (!uJson.ok) throw new Error(uJson.error || 'Не удалось получить узлы');
+
+      // Ответ от /units у разных каталогов может иметь разную вложенность.
+      // Наиболее типичный: data: [{ units: [ {unitId, name, ...}, ... ] }]
+      const data0 = Array.isArray(uJson.data) ? uJson.data[0] : uJson.data || {};
+      const units = data0.units || data0?.saaUnits || data0?.unit || [];
+
+      const msg = renderUnitsList(units);
+      await this.bot.sendMessage(chatId, msg.text, {
+        parse_mode: msg.parse_mode,
+        reply_markup: msg.reply_markup,
+        disable_web_page_preview: msg.disable_web_page_preview,
+      });
     } catch (e) {
-      await this.bot.sendMessage(msg.chat.id, `Ошибка при сбросе: ${escapeHtml(e.message || String(e))}`, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
+      await this.bot.sendMessage(chatId,
+        `Не удалось получить узлы: <code>${escapeHtml(String(e?.message || e))}</code>`,
+        { parse_mode: 'HTML' }
+      );
     }
   }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
