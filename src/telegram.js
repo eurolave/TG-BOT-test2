@@ -1,14 +1,14 @@
 // src/telegram.js
 import TelegramBot from 'node-telegram-bot-api';
-import { getByVin } from './laximoClient.js';
-import { formatVinCardHtml } from './formatters.js';
+import { getByVin, getUnits } from './laximoClient.js';
+import { formatVinCardHtml, formatUnitsPage } from './formatters.js';
 import { chunk, maskVin, escapeHtml, fmtMoney } from './utils.js';
 import { chat as gptChat, reset as gptReset } from './gpt.js';
 import { getBalance, setBalance, addBalance, chargeBalance } from './userStore.js';
 
 const VIN_RE = /\b([A-HJ-NPR-Z0-9]{8,})\b/i;
 
-/** Постоянные «кнопки меню» под полем ввода (ReplyKeyboard) */
+/** ReplyKeyboard под полем ввода */
 function homeKeyboard() {
   return {
     keyboard: [
@@ -20,52 +20,50 @@ function homeKeyboard() {
   };
 }
 
-/**
- * ───────────────────── Compact Callback Store ─────────────────────
- * Не кладём длинные данные в callback_data (лимит 64B).
- * Храним payload в памяти и передаём только короткий токен.
- */
+/** ── компактный callback store (токены ≤64B) ── */
 const cbStore = new Map(); // token -> { action, data, ts }
-const CB_TTL_MS = 10 * 60 * 1000; // 10 минут
-const CB_MAX = 5000; // лимит записей
-
+const CB_TTL_MS = 10 * 60 * 1000;
+const CB_MAX = 5000;
 function gcCbStore() {
   const now = Date.now();
-  for (const [k, v] of cbStore) {
-    if (now - v.ts > CB_TTL_MS) cbStore.delete(k);
-  }
+  for (const [k, v] of cbStore) if (now - v.ts > CB_TTL_MS) cbStore.delete(k);
   if (cbStore.size > CB_MAX) {
     const arr = [...cbStore.entries()].sort((a, b) => a[1].ts - b[1].ts);
-    const toDel = arr.slice(0, cbStore.size - CB_MAX);
-    for (const [k] of toDel) cbStore.delete(k);
+    for (const [k] of arr.slice(0, cbStore.size - CB_MAX)) cbStore.delete(k);
   }
 }
 function makeToken() { return Math.random().toString(36).slice(2, 14); }
-function packCb(action, data) {
-  gcCbStore();
-  const token = makeToken();
-  cbStore.set(token, { action, data, ts: Date.now() });
-  return `x:${token}`;
-}
-function unpackCb(cbData) {
-  if (!cbData || typeof cbData !== 'string') return null;
-  const m = cbData.match(/^x:([a-z0-9]+)$/i);
-  if (!m) return null;
-  const rec = cbStore.get(m[1]);
-  return rec || null;
-}
+function packCb(action, data) { gcCbStore(); const t = makeToken(); cbStore.set(t, { action, data, ts: Date.now() }); return `x:${t}`; }
+function unpackCb(s) { const m = /^x:([a-z0-9]+)$/i.exec(String(s||'')); return m ? cbStore.get(m[1]) || null : null; }
 
-/** Inline-клавиатура для карточки VIN (через токены) */
+/** Inline-клава карточки VIN */
 function vinInlineKeyboard(payload) {
-  // payload: { vin, locale, catalog, ssd }
-  const btnUnits   = packCb('units',   payload);
-  const btnDetails = packCb('details', payload);
+  const btnUnits   = packCb('units',   { ...payload, page: 0 });
   const btnRefresh = packCb('refresh', { vin: payload.vin, locale: payload.locale });
   return {
     inline_keyboard: [[
       { text: '🔩 Узлы',     callback_data: btnUnits },
-      { text: '🧩 Детали',   callback_data: btnDetails },
       { text: '🔁 Обновить', callback_data: btnRefresh }
+    ]]
+  };
+}
+
+/** Inline-клава списка узлов c пагинацией */
+function unitsInlineKeyboard(payload) {
+  // payload: { vin, locale, catalog, ssd, page, perPage, total }
+  const prev = Math.max(0, (payload.page || 0) - 1);
+  const next = Math.min(Math.ceil((payload.total || 0) / (payload.perPage || 10)) - 1, (payload.page || 0) + 1);
+
+  const prevBtn = packCb('units_page', { ...payload, page: prev });
+  const nextBtn = packCb('units_page', { ...payload, page: next });
+  const backBtn = packCb('vin_back',   { vin: payload.vin, locale: payload.locale });
+
+  return {
+    inline_keyboard: [[
+      { text: '⬅️ Назад', callback_data: prevBtn },
+      { text: '➡️ Далее', callback_data: nextBtn },
+    ], [
+      { text: '🔙 К VIN', callback_data: backBtn }
     ]]
   };
 }
@@ -85,15 +83,15 @@ export default class Bot {
     this.bot.onText(/^\/gpt(?:@[\w_]+)?\s*(.*)$/is, (m, mm) => this.handleGpt(m, mm[1]));
     this.bot.onText(/^\/reset\b/i, (m) => this.onReset(m));
 
-    // Баланс — показать/пополнить/списать
+    // Баланс
     this.bot.onText(/^\/balance\b/i, (m) => this.onBalance(m));
     this.bot.onText(/^\/topup\s+(-?\d+(?:\.\d+)?)$/i, (m, mm) => this.onTopUp(m, mm[1]));
     this.bot.onText(/^\/charge\s+(-?\d+(?:\.\d+)?)$/i, (m, mm) => this.onCharge(m, mm[1]));
 
-    // Свободные сообщения — сначала проверим кнопки/вин, иначе GPT
+    // Сообщения
     this.bot.on('message', (m) => this.onMessage(m));
 
-    // Обработчик inline-кнопок
+    // Callback
     this.bot.on('callback_query', (q) => this.onCallback(q));
 
     this.bot.on('polling_error', (e) => console.error('[polling_error]', e));
@@ -114,18 +112,14 @@ export default class Bot {
     );
   }
 
-  async startPolling() {
-    this.bot.options.polling = { interval: 800, params: { timeout: 30 } };
-    await this.bot.startPolling();
-  }
+  async startPolling() { this.bot.options.polling = { interval: 800, params: { timeout: 30 } }; await this.bot.startPolling(); }
   async setWebhook(url) { await this.bot.setWebHook(url); }
   processUpdate(update) { this.bot.processUpdate(update); }
 
-  // ───────────────────────── UI ─────────────────────────
+  // UI
   async onStart(msg) {
     const userId = msg.from?.id;
     const balance = fmtMoney(await getBalance(userId));
-
     const text = [
       '👋 <b>Привет!</b> Я помогу тебе работать с VIN и общаться с GPT-5.',
       '',
@@ -134,18 +128,12 @@ export default class Bot {
       '',
       '✨ Вот что я умею:',
       '• 🔎 <b>Подбор по VIN</b> — <code>/vin WAUZZZ...</code> или кнопка ниже.',
-      '• 🤖 <b>GPT-чат</b> — спроси что угодно через <code>/gpt &lt;вопрос&gt;</code> или кнопку ниже.',
-      '• ♻️ <b>Сбросить контекст GPT</b> — команда <code>/reset</code>.',
+      '• 🤖 <b>GPT-чат</b> — <code>/gpt &lt;вопрос&gt;</code> или кнопка ниже.',
+      '• ♻️ <b>Сбросить контекст</b> — <code>/reset</code>.',
       '',
-      '💡 <i>Подсказка:</i> просто пришли VIN прямо в чат — и я сам его распознаю.',
-      '',
-      '🛠️ Пополнение/списание (для теста): <code>/topup 100</code>, <code>/charge 50</code>'
+      '💡 Просто пришли VIN в чат — я сам его распознаю.'
     ].join('\n');
-
-    await this.bot.sendMessage(msg.chat.id, text, {
-      parse_mode: 'HTML',
-      reply_markup: homeKeyboard()
-    });
+    await this.bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
   }
   async onHelp(msg) { return this.onStart(msg); }
   async onMenu(msg) {
@@ -158,7 +146,7 @@ export default class Bot {
     );
   }
 
-  // ───────────────────── Баланс ─────────────────────
+  // Баланс
   async onBalance(msg) {
     const userId = msg.from?.id;
     const balance = fmtMoney(await getBalance(userId));
@@ -176,11 +164,7 @@ export default class Bot {
     }
     await addBalance(userId, amount);
     const balance = fmtMoney(await getBalance(userId));
-    await this.bot.sendMessage(
-      msg.chat.id,
-      `✅ Пополнено на <code>${escapeHtml(fmtMoney(amount))}</code>\n💳 Новый баланс: <code>${escapeHtml(balance)}</code>`,
-      { parse_mode: 'HTML', reply_markup: homeKeyboard() }
-    );
+    await this.bot.sendMessage(msg.chat.id, `✅ Пополнено на <code>${escapeHtml(balance)}</code>`, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
   }
   async onCharge(msg, amountStr) {
     const userId = msg.from?.id;
@@ -190,60 +174,36 @@ export default class Bot {
     }
     await chargeBalance(userId, amount);
     const balance = fmtMoney(await getBalance(userId));
-    await this.bot.sendMessage(
-      msg.chat.id,
-      `✅ Списано <code>${escapeHtml(fmtMoney(amount))}</code>\n💳 Новый баланс: <code>${escapeHtml(balance)}</code>`,
-      { parse_mode: 'HTML', reply_markup: homeKeyboard() }
-    );
+    await this.bot.sendMessage(msg.chat.id, `✅ Списано. Баланс: <code>${escapeHtml(balance)}</code>`, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
   }
 
-  // ───────────────────── Сообщения ─────────────────────
+  // Сообщения
   async onMessage(msg) {
     const text = (msg.text || '').trim();
     if (!text) return;
 
-    // Нажатия на большие кнопки ReplyKeyboard
     if (text === '🔎 Подбор по VIN') {
-      return this.bot.sendMessage(
-        msg.chat.id,
-        'Пришлите VIN или используйте команду:\n<code>/vin WAUZZZ... [locale]</code>',
-        { parse_mode: 'HTML' }
-      );
+      return this.bot.sendMessage(msg.chat.id, 'Пришлите VIN или используйте команду:\n<code>/vin WAUZZZ... [locale]</code>', { parse_mode: 'HTML' });
     }
     if (text === '🤖 GPT-чат') {
-      return this.bot.sendMessage(
-        msg.chat.id,
-        'Спросите что-нибудь: <code>/gpt Чем GPT-5 отличается?</code>',
-        { parse_mode: 'HTML' }
-      );
+      return this.bot.sendMessage(msg.chat.id, 'Спросите что-нибудь: <code>/gpt Чем GPT-5 отличается?</code>', { parse_mode: 'HTML' });
     }
-    if (text === '💳 Баланс') {
-      return this.onBalance(msg);
-    }
-    if (text === '♻️ Сброс GPT контекста') {
-      return this.onReset(msg);
-    }
+    if (text === '💳 Баланс')  return this.onBalance(msg);
+    if (text === '♻️ Сброс GPT контекста') return this.onReset(msg);
 
-    // Прямо отправили VIN?
     const vinMatch = text.match(VIN_RE);
     if (vinMatch && !text.startsWith('/')) {
       return this.handleVin(msg, vinMatch[1], process.env.DEFAULT_LOCALE || 'ru_RU');
     }
-
-    // Иначе — GPT-чат
-    if (!text.startsWith('/')) {
-      return this.handleGpt(msg, text);
-    }
-    // Команды обрабатываются onText
+    if (!text.startsWith('/')) return this.handleGpt(msg, text);
   }
 
-  // ───────────────────────── VIN ─────────────────────────
+  // VIN
   async handleVin(msg, vin, locale = 'ru_RU', opts = {}) {
     const chatId = msg.chat.id;
     const typing = this.bot.sendChatAction(chatId, 'typing').catch(() => {});
     try {
       const json = await getByVin(vin, locale, opts);
-
       const userId = msg.from?.id;
       const balance = fmtMoney(await getBalance(userId));
 
@@ -253,19 +213,11 @@ export default class Bot {
       ].join('\n');
 
       const { html, tech } = formatVinCardHtml(json);
-
-      // компактый payload для кнопок
       const payload = { vin, locale, catalog: tech.catalog || '', ssd: tech.ssd || '' };
       const inline = vinInlineKeyboard(payload);
 
-      // Шапка + карточка (HTML), без отправки JSON-файла
-      await this.bot.sendMessage(chatId, header, {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        reply_markup: homeKeyboard()
-      });
+      await this.bot.sendMessage(chatId, header, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: homeKeyboard() });
 
-      // Клавиатуру вешаем только на первую часть карточки
       let first = true;
       for (const part of chunk(html, 3500)) {
         await this.bot.sendMessage(chatId, part, {
@@ -276,27 +228,17 @@ export default class Bot {
         first = false;
       }
     } catch (e) {
-      await this.bot.sendMessage(
-        chatId,
-        `Не удалось получить данные по VIN: ${escapeHtml(e.message || String(e))}`,
-        { parse_mode: 'HTML', reply_markup: homeKeyboard() }
-      );
-    } finally {
-      await typing;
-    }
+      await this.bot.sendMessage(chatId, `Не удалось получить данные по VIN: ${escapeHtml(e.message || String(e))}`, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
+    } finally { await typing; }
   }
 
-  // ─────────────────────── CALLBACKS ───────────────────────
+  // CALLBACKS
   async onCallback(q) {
     try {
       const chatId = q.message.chat.id;
       const rec = unpackCb(q.data);
       if (!rec) {
-        await this.bot.sendMessage(
-          chatId,
-          '⛔ Данные для кнопки устарели. Пожалуйста, повторите запрос VIN.',
-          { parse_mode: 'HTML' }
-        );
+        await this.bot.sendMessage(chatId, '⛔ Данные для кнопки устарели. Повторите запрос VIN.', { parse_mode: 'HTML' });
         return this.safeAnswerCallback(q.id);
       }
 
@@ -307,20 +249,41 @@ export default class Bot {
         return this.safeAnswerCallback(q.id);
       }
 
-      if (action === 'units' || action === 'details') {
-        // Подсказка до подключения реальных эндпоинтов
-        const txt = action === 'units'
-          ? 'Функция «Узлы» станет активной после подключения REST-эндпоинта /units в вашем Laximo-Connect.'
-          : 'Функция «Детали» станет активной после подключения REST-эндпоинта /details в вашем Laximo-Connect.';
-        const tech = [
-          data.catalog ? `catalog: <code>${escapeHtml(data.catalog)}</code>` : null,
-          data.ssd ? `ssd: <code>${escapeHtml(String(data.ssd).slice(0, 12))}…</code>` : null
-        ].filter(Boolean).join(' • ');
-        await this.bot.sendMessage(chatId, [txt, tech ? `\n${tech}` : ''].join('\n'), { parse_mode: 'HTML' });
+      if (action === 'vin_back') {
+        await this.handleVin(q.message, data.vin, data.locale);
         return this.safeAnswerCallback(q.id);
       }
 
-      // дефолт
+      if (action === 'units' || action === 'units_page') {
+        const { vin, locale, catalog, ssd } = data;
+        const page = Math.max(0, data.page || 0);
+        const perPage = 10;
+
+        // грузим список узлов (из кэша/REST)
+        let unitsResp;
+        try {
+          unitsResp = await getUnits(catalog, ssd, locale);
+        } catch (e) {
+          await this.bot.sendMessage(chatId, `Не удалось получить узлы: ${escapeHtml(e.message || String(e))}`, { parse_mode: 'HTML' });
+          return this.safeAnswerCallback(q.id);
+        }
+
+        const units = Array.isArray(unitsResp?.data) ? unitsResp.data : [];
+        const total = units.length;
+
+        if (total === 0) {
+          await this.bot.sendMessage(chatId, 'Узлы не найдены для данного VIN.', { parse_mode: 'HTML' });
+          return this.safeAnswerCallback(q.id);
+        }
+
+        const html = formatUnitsPage(units, page, perPage, locale);
+        const kb = unitsInlineKeyboard({ vin, locale, catalog, ssd, page, perPage, total });
+
+        await this.bot.sendMessage(chatId, html, { parse_mode: 'HTML', reply_markup: kb });
+        return this.safeAnswerCallback(q.id);
+      }
+
+      // по умолчанию
       await this.safeAnswerCallback(q.id);
     } catch (e) {
       console.error('[callback_error]', e);
@@ -328,46 +291,29 @@ export default class Bot {
     }
   }
 
-  safeAnswerCallback(id) {
-    return this.bot.answerCallbackQuery(id).catch(() => {});
-  }
+  safeAnswerCallback(id) { return this.bot.answerCallbackQuery(id).catch(() => {}); }
 
-  // ───────────────────────── GPT ─────────────────────────
+  // GPT
   async handleGpt(msg, promptText) {
     const chatId = msg.chat.id;
     const typing = this.bot.sendChatAction(chatId, 'typing').catch(() => {});
     try {
       const answer = await gptChat(chatId, promptText || 'Привет!');
       for (const part of chunk(answer)) {
-        await this.bot.sendMessage(chatId, part, {
-          parse_mode: 'HTML',
-          disable_web_page_preview: true,
-          reply_markup: homeKeyboard()
-        });
+        await this.bot.sendMessage(chatId, part, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: homeKeyboard() });
       }
     } catch (e) {
-      await this.bot.sendMessage(
-        chatId,
-        `GPT ошибка: ${escapeHtml(e.message || String(e))}`,
-        { parse_mode: 'HTML', reply_markup: homeKeyboard() }
-      );
-    } finally {
-      await typing;
-    }
+      await this.bot.sendMessage(chatId, `GPT ошибка: ${escapeHtml(e.message || String(e))}`, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
+    } finally { await typing; }
   }
 
-  // ───────────────────────── RESET ─────────────────────────
+  // RESET
   async onReset(msg) {
     try {
       gptReset(msg.chat.id);
-      await this.bot.sendMessage(msg.chat.id, 'Контекст GPT очищен ✅', {
-        reply_markup: homeKeyboard()
-      });
+      await this.bot.sendMessage(msg.chat.id, 'Контекст GPT очищен ✅', { reply_markup: homeKeyboard() });
     } catch (e) {
-      await this.bot.sendMessage(msg.chat.id, `Ошибка при сбросе: ${escapeHtml(e.message || String(e))}`, {
-        parse_mode: 'HTML',
-        reply_markup: homeKeyboard()
-      });
+      await this.bot.sendMessage(msg.chat.id, `Ошибка при сбросе: ${escapeHtml(e.message || String(e))}`, { parse_mode: 'HTML', reply_markup: homeKeyboard() });
     }
   }
 }
