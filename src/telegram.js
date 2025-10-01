@@ -257,16 +257,13 @@ export default class Bot {
       const rootSsd = vehicle.ssd;
       await setUserVehicle(userId, { catalog, vehicleId, rootSsd });
 
-      // Кнопка «Категории»
-      await this._safeSendMessage(
-        chatId,
-        'Что дальше?',
-        {
-          reply_markup: {
-            inline_keyboard: [[{ text: '📂 Категории', callback_data: 'cats' }]]
-          }
-        }
-      );
+      
+      // Кнопка «Перейти в каталог» (без лишнего текста)
++      await this._safeSendMessage(chatId, '\u200B', {
++        reply_markup: {
++          inline_keyboard: [[{ text: '📂 Перейти в каталог', callback_data: 'cats' }]]
++        }
++      });
     } catch (e) {
       await this._safeSendMessage(
         chatId,
