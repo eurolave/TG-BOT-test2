@@ -1,28 +1,6 @@
-// helpers/renderCategories.js
+// src/helpers/renderCategories.js
 
-/**
- * Формат "красивой шапки" по данным из /vin
- * Ожидает структуру vehicle уровня:
- * {
- *   brand: 'AUDI',
- *   name: 'Q7',
- *   catalog: 'AU1587',
- *   vehicleId: '0',
- *   ssd: '...'
- *   attributes: {
- *     date: { name: 'Дата выпуска', value: '16.08.2017' },
- *     manufactured: { name: 'Выпущено', value: '2018' },
- *     prodrange: { name: 'Период производства', value: '2016 - 2026' },
- *     market: { name: 'Рынок', value: 'Европа' },
- *     engine: { name: 'Двигатель', value: 'CVMD' },
- *     engine_info: { name: 'Двигатель', value: '3000CC / 249hp / 183kW TDI CR' },
- *     engineno: { name: 'Номер двигателя', value: '16658' },
- *     transmission: { name: 'КПП', value: 'SUQ(8A)' },
- *     framecolor: { name: 'Цвет кузова', value: '2T2T' },
- *     trimcolor: { name: 'Цвет салона', value: 'FZ' }
- *   }
- * }
- */
+/* ───────────────── Vehicle header ───────────────── */
 
 export function renderVehicleHeader(vehicle = {}) {
   const { brand = '', name = '', catalog = '', vehicleId = '', ssd = '', attributes = {} } = vehicle || {};
@@ -35,7 +13,7 @@ export function renderVehicleHeader(vehicle = {}) {
   };
 
   const title = [
-    brand || name ? `🚗 <b>${H(brand || '')} ${H(name || '')}</b>` : '🚗 <b>Автомобиль</b>',
+    (brand || name) ? `🚗 <b>${H(brand)} ${H(name)}</b>` : '🚗 <b>Автомобиль</b>',
     catalog ? ` · <code>${H(catalog)}</code>` : '',
   ].join('');
 
@@ -50,87 +28,30 @@ export function renderVehicleHeader(vehicle = {}) {
     line('Цвет кузова', A('framecolor'), '🎨') +
     line('Цвет салона', A('trimcolor'), '🧵');
 
-  // Техконтекст — полезно при отладке, но не мешаем пользователю
   const tech = [
     vehicleId ? `• vehicleId: <code>${H(vehicleId)}</code>` : '',
-    catalog ? `• catalog: <code>${H(catalog)}</code>` : '',
-    ssd ? `• ssd: <code>${H(ssd.slice(0, 16))}…</code>` : '',
-  ]
-    .filter(Boolean)
-    .join('\n');
+    catalog   ? `• catalog:   <code>${H(catalog)}</code>`   : '',
+    ssd       ? `• ssd:       <code>${H(ssd.slice(0, 16))}…</code>` : '',
+  ].filter(Boolean).join('\n');
 
   return [
     title,
     info ? '\n' + info.trim() : '',
     tech ? '\n<code>' + tech + '</code>' : '',
-  ]
-    .filter(Boolean)
-    .join('\n')
-    .trim();
+  ].filter(Boolean).join('\n').trim();
 }
 
-/**
- * Рендер списка корневых категорий (инлайн-кнопки).
- * Ожидает формат, который ты отдаёшь из /categories:
- * data: [{ root: [ { id, name, children? }, ... ] }]
- */
-export function renderCategoriesList(categoriesRoot) {
-  const root = Array.isArray(categoriesRoot?.[0]?.root) ? categoriesRoot[0].root : [];
-  const buttons = [];
-
-  for (const cat of root) {
-    const text = truncate(cat?.name || 'Без названия', 48);
-    const id = String(cat?.id ?? '');
-    if (!id) continue;
-    buttons.push([{ text, callback_data: `cat:${id}` }]);
-  }
-
-  // группируем по 2 в ряд (если хочется по 3 — поменяй chunkSize)
-  const chunkSize = 2;
-  const rows = [];
-  for (let i = 0; i < buttons.length; i += chunkSize) {
-    const row = buttons.slice(i, i + chunkSize).map(([btn]) => btn);
-    rows.push(row);
-  }
-
-  return {
-    text: '🗂️ <b>Категории</b>\nВыберите раздел:',
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-    reply_markup: { inline_keyboard: rows.length ? rows : [[{ text: 'Обновить', callback_data: 'noop:refresh' }]] },
-  };
-}
-
-/**
- * Рендер списка узлов в выбранной категории
- * Ожидает массив units: [ { unitId, name, ... }, ... ]
- */
-// ОСТАВЬ renderVehicleHeader и renderUnitsList как есть.
-// ЗАМЕНИ только эту функцию ↓↓↓
+/* ───────────────── Categories list with pagination ─────────────────
+   Поддерживает разные форматы:
+   1) data: [{ root: [ {id,name,...}, ... ] }]
+   2) data: [ {id,name,...}, ... ]
+   3) { root: [...] }
+   4) [ ... ]
+*/
 
 export function renderCategoriesList(categoriesRoot, page = 0, perPage = 40) {
-  // Поддерживаем оба формата:
-  // 1) data: [{ root: [ {id,name,children?}, ... ] }]
-  // 2) data: [ {id,name,children?}, ... ]   (иногда сервис сразу отдаёт корень)
+  const root = extractRoot(categoriesRoot);
 
-  // Достаём массив верхнего уровня
-  let root =
-    Array.isArray(categoriesRoot?.[0]?.root) ? categoriesRoot[0].root
-  : Array.isArray(categoriesRoot?.root)       ? categoriesRoot.root
-  : Array.isArray(categoriesRoot)             ? categoriesRoot
-  : [];
-
-  // Если неожиданная обёртка
-  if (!Array.isArray(root) && categoriesRoot?.data) {
-    const d = categoriesRoot.data;
-    root =
-      Array.isArray(d?.[0]?.root) ? d[0].root
-    : Array.isArray(d?.root)      ? d.root
-    : Array.isArray(d)            ? d
-    : [];
-  }
-
-  // Фолбэк: если вообще пусто — текст без клавиатуры
   if (!Array.isArray(root) || root.length === 0) {
     return {
       text: '🗂️ <b>Категории</b>\nКатегории не найдены.',
@@ -139,7 +60,6 @@ export function renderCategoriesList(categoriesRoot, page = 0, perPage = 40) {
     };
   }
 
-  // Нормализуем элементы (на всякий)
   const items = root
     .map(x => ({
       id: x?.id ?? x?.categoryId ?? x?.code ?? '',
@@ -147,31 +67,27 @@ export function renderCategoriesList(categoriesRoot, page = 0, perPage = 40) {
     }))
     .filter(x => String(x.id).length > 0);
 
-  // Пагинация (Telegram иногда ругается на ОГРОМНЫЕ клавиатуры → режем)
   const total = items.length;
   const pages = Math.max(1, Math.ceil(total / perPage));
-  const cur = Math.min(Math.max(0, page), pages - 1);
+  const cur   = Math.min(Math.max(0, page), pages - 1);
   const start = cur * perPage;
-  const end = Math.min(total, start + perPage);
+  const end   = Math.min(total, start + perPage);
   const slice = items.slice(start, end);
 
-  // Кнопки по 2 в ряд
-  const rowCap = 2;
   const rows = [];
-  for (let i = 0; i < slice.length; i += rowCap) {
+  for (let i = 0; i < slice.length; i += 2) {
     rows.push(
-      slice.slice(i, i + rowCap).map(it => ({
+      slice.slice(i, i + 2).map(it => ({
         text: truncate(it.name, 48),
         callback_data: `cat:${it.id}`,
       }))
     );
   }
 
-  // Низ клавиатуры — пагинация (если нужна)
   if (pages > 1) {
     const nav = [];
-    if (cur > 0) nav.push({ text: '« Назад', callback_data: `noop:page:${cur - 1}` });
-    nav.push({ text: `Стр. ${cur + 1}/${pages}`, callback_data: 'noop:page:stay' });
+    if (cur > 0) nav.push({ text: '« Назад',   callback_data: `noop:page:${cur - 1}` });
+    nav.push({       text: `Стр. ${cur + 1}/${pages}`, callback_data: 'noop:page:stay' });
     if (cur < pages - 1) nav.push({ text: 'Вперёд »', callback_data: `noop:page:${cur + 1}` });
     rows.push(nav);
   }
@@ -182,6 +98,43 @@ export function renderCategoriesList(categoriesRoot, page = 0, perPage = 40) {
     disable_web_page_preview: true,
     reply_markup: { inline_keyboard: rows },
   };
+}
+
+/* ───────────────── Units list ───────────────── */
+
+export function renderUnitsList(units = []) {
+  const buttons = units.map(u => {
+    const text = truncate(u?.name || 'Без названия', 48);
+    const id   = String(u?.unitId ?? '');
+    return { text, callback_data: id ? `unit:${id}` : 'noop:unit' };
+  });
+
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) {
+    rows.push(buttons.slice(i, i + 2));
+  }
+
+  return {
+    text: '🔧 <b>Узлы</b>\nВыберите узел для деталей/схем:',
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: rows.length ? rows : [[{ text: 'Назад', callback_data: 'noop:back' }]] },
+  };
+}
+
+/* ───────────────── helpers ───────────────── */
+
+function extractRoot(categoriesRoot) {
+  if (Array.isArray(categoriesRoot?.[0]?.root)) return categoriesRoot[0].root;
+  if (Array.isArray(categoriesRoot?.root))      return categoriesRoot.root;
+  if (Array.isArray(categoriesRoot))            return categoriesRoot;
+
+  const d = categoriesRoot?.data;
+  if (Array.isArray(d?.[0]?.root)) return d[0].root;
+  if (Array.isArray(d?.root))      return d.root;
+  if (Array.isArray(d))            return d;
+
+  return [];
 }
 
 function truncate(s, n) {
