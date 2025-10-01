@@ -10,7 +10,9 @@ import {
   saveCategoriesSession,
   getCategorySsd,
   setUserVehicle,
-  getUserVehicle
+  getUserVehicle,
+  setCategoriesRoot,
+  getCategoriesRoot
 } from './cache.js';
 
 // ─────────────────────── UI: Reply keyboard ───────────────────────
@@ -27,10 +29,6 @@ function replyMenu() {
     ],
   };
 }
-
-// ─────────────────────── Кеш для пагинации категорий ───────────────────────
-// Держим последний результат categoriesRoot в памяти процесса по userId
-const lastCats = new Map(); // userId -> categoriesRoot
 
 export default class Bot {
   constructor(token) {
@@ -143,9 +141,40 @@ export default class Bot {
     this.bot.on('callback_query', async (q) => {
       const data = q.data || '';
 
-      // 1) Нажали «Категории»
+      // 1) Нажали «Категории» — грузим с API и обновляем кэш
       if (data === 'cats') {
         await this._handleLoadCategories(q);
+        return;
+      }
+
+      // 1.1) Нажали «Обновить» — рисуем из кэша, без похода в API
+      if (data === 'cats_cache') {
+        await this.bot.answerCallbackQuery(q.id).catch(() => {});
+        const chatId = q.message?.chat?.id;
+        const userId = q.from?.id;
+        if (!chatId || !userId) return;
+
+        const ctx = await getUserVehicle(userId);
+        const catsRoot = ctx ? await getCategoriesRoot(userId, ctx.catalog, ctx.vehicleId || '0') : null;
+        if (!catsRoot) {
+          await this._safeSendMessage(chatId, 'Кэш пуст. Нажмите «Перезагрузить».');
+          return;
+        }
+
+        const msg = renderCategoriesList(catsRoot, 0);
+        await this.bot.editMessageText(msg.text, {
+          chat_id: chatId,
+          message_id: q.message.message_id,
+          parse_mode: msg.parse_mode,
+          reply_markup: addCatsFooter(msg.reply_markup),
+          disable_web_page_preview: msg.disable_web_page_preview,
+        }).catch(async () => {
+          await this._safeSendMessage(chatId, msg.text, {
+            parse_mode: msg.parse_mode,
+            reply_markup: addCatsFooter(msg.reply_markup),
+            disable_web_page_preview: msg.disable_web_page_preview,
+          });
+        });
         return;
       }
 
@@ -156,33 +185,34 @@ export default class Bot {
         return;
       }
 
-      // 3) Пагинация категорий
+      // 3) Пагинация категорий (из кэша)
       if (data.startsWith('noop:page:')) {
         await this.bot.answerCallbackQuery(q.id).catch(() => {});
         const chatId = q.message?.chat?.id;
         const userId = q.from?.id;
         if (!chatId || !userId) return;
 
-        const categoriesRoot = lastCats.get(userId);
-        if (!categoriesRoot) {
-          await this._safeSendMessage(chatId, 'Список категорий устарел. Нажмите «Категории» ещё раз.');
+        const ctx = await getUserVehicle(userId);
+        const catsRoot = ctx ? await getCategoriesRoot(userId, ctx.catalog, ctx.vehicleId || '0') : null;
+        if (!catsRoot) {
+          await this._safeSendMessage(chatId, 'Список категорий устарел. Нажмите «Перезагрузить».');
           return;
         }
 
         const pageStr = data.split(':')[2] || '0';
         const page = Number(pageStr) || 0;
-        const msg = renderCategoriesList(categoriesRoot, page);
+        const msg = renderCategoriesList(catsRoot, page);
 
         await this.bot.editMessageText(msg.text, {
           chat_id: chatId,
           message_id: q.message.message_id,
           parse_mode: msg.parse_mode,
-          reply_markup: msg.reply_markup,
+          reply_markup: addCatsFooter(msg.reply_markup),
           disable_web_page_preview: msg.disable_web_page_preview,
         }).catch(async () => {
           await this._safeSendMessage(chatId, msg.text, {
             parse_mode: msg.parse_mode,
-            reply_markup: msg.reply_markup,
+            reply_markup: addCatsFooter(msg.reply_markup),
             disable_web_page_preview: msg.disable_web_page_preview,
           });
         });
@@ -217,7 +247,7 @@ export default class Bot {
       const vehicle = j.data?.[0]?.vehicles?.[0];
       if (!vehicle) throw new Error('В ответе нет данных автомобиля');
 
-      // Шапка
+      // Шапка (без тех.полей) — реализовано в renderVehicleHeader
       const header = renderVehicleHeader(vehicle);
       await this._safeSendMessage(chatId, header, { parse_mode: 'HTML', reply_markup: replyMenu() });
 
@@ -246,7 +276,7 @@ export default class Bot {
     }
   }
 
-  /** Шаг 2: Загрузка категорий по кнопке */
+  /** Шаг 2: Загрузка категорий по кнопке (API → кэш → вывод) */
   async _handleLoadCategories(q) {
     const chatId = q.message?.chat?.id;
     const userId = q.from?.id;
@@ -273,19 +303,19 @@ export default class Bot {
       if (!cJson?.ok) throw new Error(cJson?.error || 'Не удалось получить категории');
 
       const categoriesRoot = cJson.data;
-      const root = extractRoot(categoriesRoot); // надёжно достаём массив корня
+      const root = extractRoot(categoriesRoot); // массив корня в «как пришло»
 
-      // сохраняем в твой кеш соответствия для getCategorySsd
+      // сохраняем соответствие id→ssd (для перехода в узлы)
       await saveCategoriesSession(userId, catalog, vehicleId || '0', root);
 
-      // сохраняем для пагинации
-      lastCats.set(userId, categoriesRoot);
+      // сохраняем ПОЛНУЮ структуру категорий, чтобы рисовать «Обновить» и пагинацию из кэша
+      await setCategoriesRoot(userId, catalog, vehicleId || '0', categoriesRoot);
 
-      // рендер
+      // рендер (как пришло) + кнопки «Обновить/Перезагрузить»
       const msg = renderCategoriesList(categoriesRoot);
       await this._safeSendMessage(chatId, msg.text, {
         parse_mode: msg.parse_mode,
-        reply_markup: msg.reply_markup,
+        reply_markup: addCatsFooter(msg.reply_markup),
         disable_web_page_preview: msg.disable_web_page_preview,
       });
     } catch (e) {
@@ -360,6 +390,18 @@ export default class Bot {
 }
 
 // ─────────────────────── helpers ───────────────────────
+
+/** Добавить в конец клавиатуры кнопки «Обновить/Перезагрузить» */
+function addCatsFooter(reply_markup) {
+  const rm = reply_markup || {};
+  const kb = Array.isArray(rm.inline_keyboard) ? rm.inline_keyboard.slice() : [];
+  kb.push([
+    { text: '🔁 Обновить', callback_data: 'cats_cache' },
+    { text: '🔄 Перезагрузить', callback_data: 'cats' },
+  ]);
+  return { inline_keyboard: kb };
+}
+
 function extractRoot(categoriesRoot) {
   // Поддержка разных форматов:
   // 1) [{ root: [...] }]
