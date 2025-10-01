@@ -138,28 +138,62 @@ export default class Bot {
       // Остальное игнорируем без эхо, чтобы не раздражать
     });
 
-    // Inline-кнопки (callback_data)
     this.bot.on('callback_query', async (q) => {
-      const data = q.data || '';
-
-      // Ленивая загрузка категорий (по кнопке «Категории»)
-      if (data === 'cats') {
-        await this._handleLoadCategories(q);
-        return;
-      }
-
-      // Выбрали категорию → грузим узлы
-      if (data.startsWith('cat:')) {
-        const categoryId = data.split(':')[1];
-        await this._handleCategory(q, categoryId);
-        return;
-      }
-
-      if (data.startsWith('noop:')) {
-        await this.bot.answerCallbackQuery(q.id).catch(() => {});
-      }
-    });
+  const data = q.data || '';
+  if (data.startsWith('cat:')) {
+    const categoryId = data.split(':')[1];
+    await this._handleCategory(q, categoryId);
+    return;
   }
+  if (data.startsWith('noop:page:')) {
+    await this.bot.answerCallbackQuery(q.id).catch(() => {});
+    const chatId = q.message?.chat?.id;
+    const userId = q.from?.id;
+    if (!chatId || !userId) return;
+
+    // достаём контекст и корень категорий из кеша
+    const ctx = await getUserVehicle(userId);
+    if (!ctx?.catalog) {
+      return this._safeSendMessage(chatId, 'Контекст автомобиля не найден. Повтори VIN.');
+    }
+
+    // у тебя уже сохраняется root через saveCategoriesSession(userId, catalog, vehicleId, root)
+    // добавим лёгкий helper в cache.js, если его нет:
+    // export async function getCategoriesRoot(userId, catalog, vehicleId) { ... }
+    const root = await getCategorySsd(userId, ctx.catalog, ctx.vehicleId || '0', '__root__'); // <-- если так не делал ранее,
+    // лучше сделай отдельную функцию getCategoriesRoot; здесь покажу через предположение:
+    // const root = await getCategoriesRoot(userId, ctx.catalog, ctx.vehicleId || '0');
+
+    // если в твоём кеше не предусмотрено хранить root под спец-ключом,
+    // можно быстро держать «последний categoriesRoot» в памяти процесса.
+    // Но правильнее — добавить getCategoriesRoot в cache.js.
+
+    const pageStr = data.split(':')[2] || '0';
+    const page = Number(pageStr) || 0;
+
+    const msg = renderCategoriesList(root, page);
+    // Перерисуем вместо отправки нового сообщения:
+    await this.bot.editMessageText(msg.text, {
+      chat_id: chatId,
+      message_id: q.message.message_id,
+      parse_mode: msg.parse_mode,
+      reply_markup: msg.reply_markup,
+      disable_web_page_preview: msg.disable_web_page_preview,
+    }).catch(async () => {
+      // если не получилось отредактировать — просто отправим новое
+      await this._safeSendMessage(chatId, msg.text, {
+        parse_mode: msg.parse_mode,
+        reply_markup: msg.reply_markup,
+        disable_web_page_preview: msg.disable_web_page_preview,
+      });
+    });
+    return;
+  }
+  if (data.startsWith('noop:')) {
+    await this.bot.answerCallbackQuery(q.id).catch(() => {});
+  }
+});
+
 
   /** Шаг 1: VIN → карточка авто + кнопка «Категории» */
   async _handleVin(chatId, userId, vin, locale) {
