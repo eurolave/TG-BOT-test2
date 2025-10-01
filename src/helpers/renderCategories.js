@@ -105,31 +105,85 @@ export function renderCategoriesList(categoriesRoot) {
  * Рендер списка узлов в выбранной категории
  * Ожидает массив units: [ { unitId, name, ... }, ... ]
  */
-export function renderUnitsList(units = []) {
-  const rows = [];
-  const buttons = units.map((u) => {
-    const text = truncate(u?.name || 'Без названия', 48);
-    const id = String(u?.unitId ?? '');
-    // Если нет unitId — делаем noop кнопку, чтобы пользователь видел элемент
-    const cb = id ? `unit:${id}` : 'noop:unit';
-    return { text, callback_data: cb };
-  });
+// ОСТАВЬ renderVehicleHeader и renderUnitsList как есть.
+// ЗАМЕНИ только эту функцию ↓↓↓
 
-  // по 2 в ряд
-  const chunkSize = 2;
-  for (let i = 0; i < buttons.length; i += chunkSize) {
-    rows.push(buttons.slice(i, i + chunkSize));
+export function renderCategoriesList(categoriesRoot, page = 0, perPage = 40) {
+  // Поддерживаем оба формата:
+  // 1) data: [{ root: [ {id,name,children?}, ... ] }]
+  // 2) data: [ {id,name,children?}, ... ]   (иногда сервис сразу отдаёт корень)
+
+  // Достаём массив верхнего уровня
+  let root =
+    Array.isArray(categoriesRoot?.[0]?.root) ? categoriesRoot[0].root
+  : Array.isArray(categoriesRoot?.root)       ? categoriesRoot.root
+  : Array.isArray(categoriesRoot)             ? categoriesRoot
+  : [];
+
+  // Если неожиданная обёртка
+  if (!Array.isArray(root) && categoriesRoot?.data) {
+    const d = categoriesRoot.data;
+    root =
+      Array.isArray(d?.[0]?.root) ? d[0].root
+    : Array.isArray(d?.root)      ? d.root
+    : Array.isArray(d)            ? d
+    : [];
+  }
+
+  // Фолбэк: если вообще пусто — текст без клавиатуры
+  if (!Array.isArray(root) || root.length === 0) {
+    return {
+      text: '🗂️ <b>Категории</b>\nКатегории не найдены.',
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    };
+  }
+
+  // Нормализуем элементы (на всякий)
+  const items = root
+    .map(x => ({
+      id: x?.id ?? x?.categoryId ?? x?.code ?? '',
+      name: String(x?.name ?? x?.title ?? 'Без названия'),
+    }))
+    .filter(x => String(x.id).length > 0);
+
+  // Пагинация (Telegram иногда ругается на ОГРОМНЫЕ клавиатуры → режем)
+  const total = items.length;
+  const pages = Math.max(1, Math.ceil(total / perPage));
+  const cur = Math.min(Math.max(0, page), pages - 1);
+  const start = cur * perPage;
+  const end = Math.min(total, start + perPage);
+  const slice = items.slice(start, end);
+
+  // Кнопки по 2 в ряд
+  const rowCap = 2;
+  const rows = [];
+  for (let i = 0; i < slice.length; i += rowCap) {
+    rows.push(
+      slice.slice(i, i + rowCap).map(it => ({
+        text: truncate(it.name, 48),
+        callback_data: `cat:${it.id}`,
+      }))
+    );
+  }
+
+  // Низ клавиатуры — пагинация (если нужна)
+  if (pages > 1) {
+    const nav = [];
+    if (cur > 0) nav.push({ text: '« Назад', callback_data: `noop:page:${cur - 1}` });
+    nav.push({ text: `Стр. ${cur + 1}/${pages}`, callback_data: 'noop:page:stay' });
+    if (cur < pages - 1) nav.push({ text: 'Вперёд »', callback_data: `noop:page:${cur + 1}` });
+    rows.push(nav);
   }
 
   return {
-    text: '🔧 <b>Узлы</b>\nВыберите узел для деталей/схем:',
+    text: '🗂️ <b>Категории</b>\nВыберите раздел:',
     parse_mode: 'HTML',
     disable_web_page_preview: true,
-    reply_markup: { inline_keyboard: rows.length ? rows : [[{ text: 'Назад', callback_data: 'noop:back' }]] },
+    reply_markup: { inline_keyboard: rows },
   };
 }
 
-/* ───────────────────────── helpers ───────────────────────── */
 function truncate(s, n) {
   const t = String(s || '');
   return t.length > n ? t.slice(0, n - 1) + '…' : t;
