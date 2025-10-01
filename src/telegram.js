@@ -13,7 +13,7 @@ import {
   getUserVehicle
 } from './cache.js';
 
-// Тексты кнопок меню (reply keyboard)
+// ─────────────────────── UI: Reply keyboard ───────────────────────
 const BTN_VIN   = '🔎 Подбор по VIN';
 const BTN_GPT   = '🤖 GPT-чат';
 const BTN_RESET = '♻️ Сброс контекста';
@@ -27,6 +27,10 @@ function replyMenu() {
     ],
   };
 }
+
+// ─────────────────────── Кеш для пагинации категорий ───────────────────────
+// Держим последний результат categoriesRoot в памяти процесса по userId
+const lastCats = new Map(); // userId -> categoriesRoot
 
 export default class Bot {
   constructor(token) {
@@ -87,16 +91,15 @@ export default class Bot {
       await this._handleVin(chatId, msg.from.id, vin, locale);
     });
 
-    // ReplyKeyboard кнопки
+    // ReplyKeyboard кнопки и простые сообщения
     this.bot.on('message', async (msg) => {
       if (!msg.text) return;
       const chatId = msg.chat.id;
       const t = msg.text.trim();
 
-      // Командные сообщения не дублируем
+      // Команды — не дублируем
       if (/^\/(start|vin|gpt|reset|ping)\b/i.test(t)) return;
 
-      // Нажатие кнопки "Подбор по VIN"
       if (t === BTN_VIN) {
         const hint = [
           '<b>Подбор по VIN</b>',
@@ -110,7 +113,6 @@ export default class Bot {
         return;
       }
 
-      // Нажатие кнопки "GPT-чат"
       if (t === BTN_GPT) {
         const hint = [
           '<b>GPT-чат</b>',
@@ -121,7 +123,6 @@ export default class Bot {
         return;
       }
 
-      // Нажатие кнопки "Сброс контекста"
       if (t === BTN_RESET) {
         const hint = 'Чтобы сбросить контекст GPT, используйте команду: <code>/reset</code>';
         await this._safeSendMessage(chatId, hint, { parse_mode: 'HTML', reply_markup: replyMenu() });
@@ -135,65 +136,65 @@ export default class Bot {
         return;
       }
 
-      // Остальное игнорируем без эхо, чтобы не раздражать
+      // Остальное игнорируем, чтобы не засорять чат
     });
 
+    // ───────────── callback_query ─────────────
     this.bot.on('callback_query', async (q) => {
-  const data = q.data || '';
-  if (data.startsWith('cat:')) {
-    const categoryId = data.split(':')[1];
-    await this._handleCategory(q, categoryId);
-    return;
-  }
-  if (data.startsWith('noop:page:')) {
-    await this.bot.answerCallbackQuery(q.id).catch(() => {});
-    const chatId = q.message?.chat?.id;
-    const userId = q.from?.id;
-    if (!chatId || !userId) return;
+      const data = q.data || '';
 
-    // достаём контекст и корень категорий из кеша
-    const ctx = await getUserVehicle(userId);
-    if (!ctx?.catalog) {
-      return this._safeSendMessage(chatId, 'Контекст автомобиля не найден. Повтори VIN.');
-    }
+      // 1) Нажали «Категории»
+      if (data === 'cats') {
+        await this._handleLoadCategories(q);
+        return;
+      }
 
-    // у тебя уже сохраняется root через saveCategoriesSession(userId, catalog, vehicleId, root)
-    // добавим лёгкий helper в cache.js, если его нет:
-    // export async function getCategoriesRoot(userId, catalog, vehicleId) { ... }
-    const root = await getCategorySsd(userId, ctx.catalog, ctx.vehicleId || '0', '__root__'); // <-- если так не делал ранее,
-    // лучше сделай отдельную функцию getCategoriesRoot; здесь покажу через предположение:
-    // const root = await getCategoriesRoot(userId, ctx.catalog, ctx.vehicleId || '0');
+      // 2) Выбор категории
+      if (data.startsWith('cat:')) {
+        const categoryId = data.split(':')[1];
+        await this._handleCategory(q, categoryId);
+        return;
+      }
 
-    // если в твоём кеше не предусмотрено хранить root под спец-ключом,
-    // можно быстро держать «последний categoriesRoot» в памяти процесса.
-    // Но правильнее — добавить getCategoriesRoot в cache.js.
+      // 3) Пагинация категорий
+      if (data.startsWith('noop:page:')) {
+        await this.bot.answerCallbackQuery(q.id).catch(() => {});
+        const chatId = q.message?.chat?.id;
+        const userId = q.from?.id;
+        if (!chatId || !userId) return;
 
-    const pageStr = data.split(':')[2] || '0';
-    const page = Number(pageStr) || 0;
+        const categoriesRoot = lastCats.get(userId);
+        if (!categoriesRoot) {
+          await this._safeSendMessage(chatId, 'Список категорий устарел. Нажмите «Категории» ещё раз.');
+          return;
+        }
 
-    const msg = renderCategoriesList(root, page);
-    // Перерисуем вместо отправки нового сообщения:
-    await this.bot.editMessageText(msg.text, {
-      chat_id: chatId,
-      message_id: q.message.message_id,
-      parse_mode: msg.parse_mode,
-      reply_markup: msg.reply_markup,
-      disable_web_page_preview: msg.disable_web_page_preview,
-    }).catch(async () => {
-      // если не получилось отредактировать — просто отправим новое
-      await this._safeSendMessage(chatId, msg.text, {
-        parse_mode: msg.parse_mode,
-        reply_markup: msg.reply_markup,
-        disable_web_page_preview: msg.disable_web_page_preview,
-      });
+        const pageStr = data.split(':')[2] || '0';
+        const page = Number(pageStr) || 0;
+        const msg = renderCategoriesList(categoriesRoot, page);
+
+        await this.bot.editMessageText(msg.text, {
+          chat_id: chatId,
+          message_id: q.message.message_id,
+          parse_mode: msg.parse_mode,
+          reply_markup: msg.reply_markup,
+          disable_web_page_preview: msg.disable_web_page_preview,
+        }).catch(async () => {
+          await this._safeSendMessage(chatId, msg.text, {
+            parse_mode: msg.parse_mode,
+            reply_markup: msg.reply_markup,
+            disable_web_page_preview: msg.disable_web_page_preview,
+          });
+        });
+        return;
+      }
+
+      // 4) Прочие noop
+      if (data.startsWith('noop:')) {
+        await this.bot.answerCallbackQuery(q.id).catch(() => {});
+      }
     });
-    return;
   }
-  if (data.startsWith('noop:')) {
-    await this.bot.answerCallbackQuery(q.id).catch(() => {});
-  }
-});
-
 
   /** Шаг 1: VIN → карточка авто + кнопка «Категории» */
   async _handleVin(chatId, userId, vin, locale) {
@@ -272,10 +273,15 @@ export default class Bot {
       if (!cJson?.ok) throw new Error(cJson?.error || 'Не удалось получить категории');
 
       const categoriesRoot = cJson.data;
-      const root = Array.isArray(categoriesRoot?.[0]?.root) ? categoriesRoot[0].root : [];
+      const root = extractRoot(categoriesRoot); // надёжно достаём массив корня
 
+      // сохраняем в твой кеш соответствия для getCategorySsd
       await saveCategoriesSession(userId, catalog, vehicleId || '0', root);
 
+      // сохраняем для пагинации
+      lastCats.set(userId, categoriesRoot);
+
+      // рендер
       const msg = renderCategoriesList(categoriesRoot);
       await this._safeSendMessage(chatId, msg.text, {
         parse_mode: msg.parse_mode,
@@ -351,6 +357,25 @@ export default class Bot {
       }
     }
   }
+}
+
+// ─────────────────────── helpers ───────────────────────
+function extractRoot(categoriesRoot) {
+  // Поддержка разных форматов:
+  // 1) [{ root: [...] }]
+  // 2) { root: [...] }
+  // 3) [ ... ]
+  // 4) { data: ... } — на всякий случай
+  if (Array.isArray(categoriesRoot?.[0]?.root)) return categoriesRoot[0].root;
+  if (Array.isArray(categoriesRoot?.root)) return categoriesRoot.root;
+  if (Array.isArray(categoriesRoot)) return categoriesRoot;
+
+  const d = categoriesRoot?.data;
+  if (Array.isArray(d?.[0]?.root)) return d[0].root;
+  if (Array.isArray(d?.root)) return d.root;
+  if (Array.isArray(d)) return d;
+
+  return [];
 }
 
 function escapeHtml(s) {
