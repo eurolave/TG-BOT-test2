@@ -5,7 +5,11 @@ import { ensure } from './utils.js';
 
 const token = ensure(process.env.TELEGRAM_TOKEN, 'TELEGRAM_TOKEN is required');
 const publicUrl = ensure(process.env.WEBHOOK_PUBLIC_URL, 'WEBHOOK_PUBLIC_URL is required');
-const port = Number(process.env.PORT || 3000);
+const port = Number(process.env.PORT);
+if (!port) {
+  console.error('[bot] ENV PORT is not set — Railway requires binding to PORT.');
+  process.exit(1);
+}
 
 const bot = new Bot(token);
 
