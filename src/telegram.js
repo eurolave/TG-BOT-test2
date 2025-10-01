@@ -258,12 +258,15 @@ export default class Bot {
       await setUserVehicle(userId, { catalog, vehicleId, rootSsd });
 
       
-      // Кнопка «Перейти в каталог» (без лишнего текста)
-      await this._safeSendMessage(chatId, '\u200B', {
-        reply_markup: {
-          inline_keyboard: [[{ text: '📂 Перейти в каталог', callback_data: 'cats' }]]
-        }
-      });
+      
+      // Кнопка «Перейти в каталог» (сообщение с NBSP, чтобы Telegram не счёл пустым)
+await this._safeSendMessage(chatId, '\u00A0', {
+  parse_mode: 'HTML',
+  reply_markup: {
+    inline_keyboard: [[{ text: '📂 Перейти в каталог', callback_data: 'cats' }]]
+  }
+});
+
     } catch (e) {
       await this._safeSendMessage(
         chatId,
