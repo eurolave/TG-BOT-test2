@@ -1,19 +1,28 @@
 // src/telegram.js
 import TelegramBot from 'node-telegram-bot-api';
 import fetch from 'node-fetch';
-import { renderVehicleHeader, renderCategoriesList, renderUnitsList } from './helpers/renderCategories.js';
-import { saveCategoriesSession, getCategorySsd, setUserVehicle, getUserVehicle } from './cache.js';
+import {
+  renderVehicleHeader,
+  renderCategoriesList,
+  renderUnitsList
+} from './helpers/renderCategories.js';
+import {
+  saveCategoriesSession,
+  getCategorySsd,
+  setUserVehicle,
+  getUserVehicle
+} from './cache.js';
 
 export default class Bot {
   constructor(token) {
-    // polling:false — мы на вебхуке; webHook:false — управляем вебхуком сами (в server.js)
+    // Мы работаем на вебхуках; polling не запускаем
     this.bot = new TelegramBot(token, { polling: false, webHook: false });
     this.name = 'LaximoBot';
 
-    // КРИТИЧЕСКОЕ: навешиваем обработчики сразу, а не в startPolling()
+    // Навешиваем обработчики сразу
     this._wireHandlers();
 
-    // Базовые логи на сеть/ошибки, чтобы видеть проблемы исходящих запросов
+    // Базовые логи
     this.bot.on('error', (e) => console.error('[tg:error]', e?.message || e));
     this.bot.on('webhook_error', (e) => console.error('[tg:webhook_error]', e?.message || e));
   }
@@ -28,14 +37,13 @@ export default class Bot {
     ]);
   }
 
-  // Оставим для локального режима, если вдруг решишь включать polling
+  // Для локального режима, если захочешь polling
   async startPolling() {
     await this.bot.startPolling({ interval: 800, params: { timeout: 30 } });
     // обработчики уже навешаны в конструкторе
   }
 
   processUpdate(update) {
-    // Важно: прокидываем апдейт в клиент библиотеки
     this.bot.processUpdate(update);
   }
 
@@ -44,7 +52,7 @@ export default class Bot {
     this.bot.onText(/^\/start\b/, async (msg) => {
       const chatId = msg.chat.id;
       const text = [
-        '<b>Привет!</b> Я помогу с подбором деталей по VIN и покажу дерево узлов.',
+        '<b>Привет!</b> Я помогаю с подбором деталей по VIN.',
         '• Подбор по VIN — <code>/vin WAUZZZ... [locale]</code>',
         '• GPT-чат — <code>/gpt &lt;вопрос&gt;</code>',
         '• Сброс контекста GPT — <code>/reset</code>',
@@ -54,7 +62,7 @@ export default class Bot {
       await this._safeSendMessage(chatId, text, { parse_mode: 'HTML' });
     });
 
-    // /ping — быстрая проверка исходящих
+    // /ping
     this.bot.onText(/^\/ping\b/i, async (msg) => {
       await this._safeSendMessage(msg.chat.id, 'pong');
     });
@@ -67,14 +75,8 @@ export default class Bot {
       await this._handleVin(chatId, msg.from.id, vin, locale);
     });
 
-    // Простой обработчик «Баланс»
-    this.bot.onText(/баланс/i, async (msg) => {
-      // Здесь можешь подставить реальную логику
-      await this._safeSendMessage(msg.chat.id, 'Баланс: 0.00 BYN (тест)');
-    });
-
     // Любое сообщение: VIN без команды → запускаем VIN-поток
-    // Иначе — эхо (на время отладки), чтобы пользователь видел, что бот «живой».
+    // Иначе — эхо (на время отладки)
     this.bot.on('message', async (msg) => {
       if (!msg.text) return;
       const chatId = msg.chat.id;
@@ -87,26 +89,39 @@ export default class Bot {
         const locale = process.env.DEFAULT_LOCALE || 'ru_RU';
         await this._handleVin(chatId, msg.from.id, t, locale);
       } else {
-        // Эхо-ответ для уверенности, что бот «отвечает» (можно убрать после отладки)
         await this._safeSendMessage(chatId, `Вы сказали: ${escapeHtml(t)}`, { parse_mode: 'HTML' });
       }
     });
 
-    // Callback: выбор категории
+    // Callback-кнопки
     this.bot.on('callback_query', async (q) => {
       const data = q.data || '';
+
+      // Нажали "Категории" (ленивый шаг — грузим только сейчас)
+      if (data === 'cats') {
+        await this._handleLoadCategories(q);
+        return;
+      }
+
+      // Выбрали категорию → грузим узлы
       if (data.startsWith('cat:')) {
         const categoryId = data.split(':')[1];
         await this._handleCategory(q, categoryId);
         return;
       }
+
       if (data.startsWith('noop:')) {
-        // просто скрыть лоадер
         await this.bot.answerCallbackQuery(q.id).catch(() => {});
       }
     });
   }
 
+  /**
+   * Шаг 1: Обработка VIN
+   * - Показываем шапку авто
+   * - Сохраняем контекст (catalog, vehicleId, rootSsd)
+   * - Предлагаем кнопку "📂 Категории"
+   */
   async _handleVin(chatId, userId, vin, locale) {
     const base = (process.env.LAXIMO_BASE_URL || '').replace(/\/+$/, '');
     if (!base) {
@@ -123,44 +138,33 @@ export default class Bot {
       const r = await fetch(url.toString());
       const j = await r.json().catch(() => ({}));
 
-      if (!j?.ok) {
-        throw new Error(j?.error || 'VIN не найден');
-      }
+      if (!j?.ok) throw new Error(j?.error || 'VIN не найден');
 
       const vehicle = j.data?.[0]?.vehicles?.[0];
-      if (!vehicle) {
-        throw new Error('В ответе нет данных автомобиля');
-      }
+      if (!vehicle) throw new Error('В ответе нет данных автомобиля');
 
-      // Шапка
+      // 1) Шапка
       const header = renderVehicleHeader(vehicle);
       await this._safeSendMessage(chatId, header, { parse_mode: 'HTML' });
 
-      // Контекст пользователя (для следующих шагов)
+      // 2) Сохраняем контекст для будущих шагов
       const catalog = vehicle.catalog;
       const vehicleId = vehicle.vehicleId || '0';
-      await setUserVehicle(userId, { catalog, vehicleId });
+      const rootSsd = vehicle.ssd; // этот ssd нужен для списка категорий
+      await setUserVehicle(userId, { catalog, vehicleId, rootSsd });
 
-      // Категории
-      const cUrl = new URL(base + '/categories');
-      cUrl.searchParams.set('catalog', catalog);
-      cUrl.searchParams.set('vehicleId', vehicleId);
-      cUrl.searchParams.set('ssd', vehicle.ssd);
-
-      const cRes = await fetch(cUrl.toString());
-      const cJson = await cRes.json().catch(() => ({}));
-      if (!cJson?.ok) throw new Error(cJson?.error || 'Не удалось получить категории');
-
-      const categoriesRoot = cJson.data;
-      const root = Array.isArray(categoriesRoot?.[0]?.root) ? categoriesRoot[0].root : [];
-      await saveCategoriesSession(userId, catalog, vehicleId, root);
-
-      const msg = renderCategoriesList(categoriesRoot);
-      await this._safeSendMessage(chatId, msg.text, {
-        parse_mode: msg.parse_mode,
-        reply_markup: msg.reply_markup,
-        disable_web_page_preview: msg.disable_web_page_preview,
-      });
+      // 3) Кнопка "Категории" (никакой автоподгрузки)
+      await this._safeSendMessage(
+        chatId,
+        'Что дальше?',
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📂 Категории', callback_data: 'cats' }]
+            ]
+          }
+        }
+      );
     } catch (e) {
       await this._safeSendMessage(
         chatId,
@@ -170,6 +174,63 @@ export default class Bot {
     }
   }
 
+  /**
+   * Шаг 2: Загрузить категории (по кнопке "cats")
+   * - Берём из контекста catalog, vehicleId, rootSsd
+   * - Грузим /categories
+   * - Кладём categoryId→ssd в кэш
+   * - Показываем список категорий с кнопками 1..N
+   */
+  async _handleLoadCategories(q) {
+    const chatId = q.message?.chat?.id;
+    const userId = q.from?.id;
+    if (!chatId || !userId) {
+      await this.bot.answerCallbackQuery(q.id).catch(() => {});
+      return;
+    }
+
+    try {
+      await this.bot.answerCallbackQuery(q.id, { text: 'Загружаю категории…' }).catch(() => {});
+      const ctx = await getUserVehicle(userId);
+      if (!ctx?.catalog || !ctx?.rootSsd) throw new Error('Контекст VIN устарел. Повтори VIN.');
+
+      const { catalog, vehicleId, rootSsd } = ctx;
+      const base = (process.env.LAXIMO_BASE_URL || '').replace(/\/+$/, '');
+
+      const cUrl = new URL(base + '/categories');
+      cUrl.searchParams.set('catalog', catalog);
+      cUrl.searchParams.set('vehicleId', vehicleId || '0');
+      cUrl.searchParams.set('ssd', rootSsd);
+
+      const cRes = await fetch(cUrl.toString());
+      const cJson = await cRes.json().catch(() => ({}));
+      if (!cJson?.ok) throw new Error(cJson?.error || 'Не удалось получить категории');
+
+      const categoriesRoot = cJson.data;
+      const root = Array.isArray(categoriesRoot?.[0]?.root) ? categoriesRoot[0].root : [];
+
+      // Сохраняем карту categoryId→ssd
+      await saveCategoriesSession(userId, catalog, vehicleId || '0', root);
+
+      // Показываем список
+      const msg = renderCategoriesList(categoriesRoot);
+      await this._safeSendMessage(chatId, msg.text, {
+        parse_mode: msg.parse_mode,
+        reply_markup: msg.reply_markup,
+        disable_web_page_preview: msg.disable_web_page_preview,
+      });
+    } catch (e) {
+      await this._safeSendMessage(
+        chatId,
+        `Не удалось получить категории: <code>${escapeHtml(String(e?.message || e))}</code>`,
+        { parse_mode: 'HTML' }
+      );
+    }
+  }
+
+  /**
+   * Шаг 3: Загрузить узлы по выбранной категории
+   */
   async _handleCategory(q, categoryId) {
     const chatId = q.message?.chat?.id;
     const userId = q.from?.id;
@@ -185,6 +246,8 @@ export default class Bot {
       if (!ctx?.catalog) throw new Error('Контекст автомобиля не найден. Повтори VIN.');
 
       const { catalog, vehicleId } = ctx;
+
+      // для units нужен свежий ssd категории
       const ssd = await getCategorySsd(userId, catalog, vehicleId || '0', categoryId);
       if (!ssd) throw new Error('Сессия категорий устарела. Повтори VIN.');
 
@@ -199,7 +262,7 @@ export default class Bot {
       const uJson = await uRes.json().catch(() => ({}));
       if (!uJson?.ok) throw new Error(uJson?.error || 'Не удалось получить узлы');
 
-      // Ответ от /units может отличаться по структуре
+      // структура может отличаться
       const data0 = Array.isArray(uJson.data) ? uJson.data[0] : (uJson.data || {});
       const units = data0.units || data0?.saaUnits || data0?.unit || [];
 
@@ -222,7 +285,6 @@ export default class Bot {
     try {
       await this.bot.sendMessage(chatId, text, opts);
     } catch (e) {
-      // Печатаем полезное описание из ответа Telegram (если есть)
       const resp = e?.response;
       if (resp?.statusCode || resp?.body) {
         console.error('[sendMessage error]', resp.statusCode, resp.body || resp);
