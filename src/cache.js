@@ -38,13 +38,23 @@ function memGet(k) {
 
 /** ───────── High-level API для категорий/контекста ───────── */
 
-/** Сохраняем список категорий (categoryId+name+ssd) */
+// нормализация полей категории из разных форматов
+function normalizeCategory(c = {}) {
+  const id =
+    c.categoryId ?? c.id ?? c.code ?? null;
+  const name =
+    c.name ?? c.title ?? '';
+  const ssd =
+    c.ssd ?? c.SSD ?? c.sSd ?? null;
+  return { categoryId: id, name, ssd };
+}
+
+/** Сохранить плоский список корневых категорий (id+name+ssd) для быстрого поиска ssd */
 export async function saveCategoriesSession(userId, catalog, vehicleId, rootArray, ttlSec = TTL_CATS) {
-  const data = (Array.isArray(rootArray) ? rootArray : []).map(c => ({
-    categoryId: c.categoryId,
-    name: c.name,
-    ssd: c.ssd
-  }));
+  const data = (Array.isArray(rootArray) ? rootArray : [])
+    .map(normalizeCategory)
+    .filter(x => x.categoryId != null);
+
   const key = `cats:${userId}:${catalog}:${vehicleId}`;
   const r = await getRedis();
   const payload = JSON.stringify(data);
@@ -58,7 +68,7 @@ export async function getCategorySsd(userId, catalog, vehicleId, categoryId) {
   let raw = r ? await r.get(key) : memGet(key);
   if (!raw) return null;
   try {
-    const arr = JSON.parse(raw);
+    const arr = JSON.parse(raw) || [];
     const found = arr.find(x => String(x.categoryId) === String(categoryId));
     return found?.ssd || null;
   } catch {
@@ -66,7 +76,7 @@ export async function getCategorySsd(userId, catalog, vehicleId, categoryId) {
   }
 }
 
-/** Храним текущий автомобиль (catalog, vehicleId) для пользователя */
+/** Храним текущий автомобиль (catalog, vehicleId, rootSsd) для пользователя */
 export async function setUserVehicle(userId, vehicle) {
   const key = `ctx:${userId}:veh`;
   const r = await getRedis();
@@ -80,12 +90,22 @@ export async function getUserVehicle(userId) {
   return raw ? JSON.parse(raw) : null;
 }
 
-/** ───────── Совместимость с существующим кодом: cacheGet/cacheSet ─────────
- * Некоторые модули ожидают универсальные функции кэша.
- * Эти шимирующие функции работают с JSON-значениями:
- *  - cacheSet(key, value, ttlSec) — сериализует value в JSON
- *  - cacheGet(key) — парсит JSON и возвращает объект/массив/скаляр
- */
+/** Полный «корень» категорий для «Обновить» (рендер из кэша без запросов) */
+export async function setCategoriesRoot(userId, catalog, vehicleId, categoriesRoot, ttlSec = TTL_CATS) {
+  const key = `catsroot:${userId}:${catalog}:${vehicleId}`;
+  const r = await getRedis();
+  const payload = JSON.stringify(categoriesRoot ?? []);
+  if (r) await r.set(key, payload, { EX: ttlSec }); else memSet(key, payload, ttlSec);
+}
+export async function getCategoriesRoot(userId, catalog, vehicleId) {
+  const key = `catsroot:${userId}:${catalog}:${vehicleId}`;
+  const r = await getRedis();
+  const raw = r ? await r.get(key) : memGet(key);
+  if (raw == null) return null;
+  try { return JSON.parse(raw); } catch { return raw; }
+}
+
+/** ───────── Универсальные cacheGet/cacheSet (совместимость) ───────── */
 
 export async function cacheSet(key, value, ttlSec = 900) {
   const r = await getRedis();
@@ -104,7 +124,6 @@ export async function cacheGet(key) {
   try {
     return JSON.parse(raw);
   } catch {
-    // если вдруг кто-то положил не-JSON — вернём сырой
     return raw;
   }
 }
