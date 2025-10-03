@@ -47,10 +47,17 @@ export function renderCategoriesList(categoriesRoot, page = 0, perPage = 40) {
   const root = extractRoot(categoriesRoot);
 
   const items = (Array.isArray(root) ? root : [])
-    .map(x => ({
-      id: x?.id ?? x?.categoryId ?? x?.code ?? '',
-      name: String(x?.name ?? x?.title ?? 'Без названия'),
-    }))
+    .map((x) => {
+      const canonicalId = x?.categoryId ?? x?.CategoryId ?? x?.categoryID ?? null;
+      const fallbackId = x?.id ?? x?.code ?? null;
+      const resolvedId = canonicalId ?? fallbackId ?? '';
+
+      return {
+        id: resolvedId,
+        canonicalId,
+        name: String(x?.name ?? x?.title ?? 'Без названия'),
+      };
+    })
     .filter(x => String(x.id).length > 0);
 
   if (!items.length) {
@@ -75,7 +82,7 @@ export function renderCategoriesList(categoriesRoot, page = 0, perPage = 40) {
     rows.push(
       slice.slice(i, i + 2).map(it => ({
         text: truncate(it.name, 48),
-        callback_data: `cat:${it.id}`,
+        callback_data: `cat:${it.canonicalId ?? it.id}`,
       }))
     );
   }

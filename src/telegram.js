@@ -8,7 +8,7 @@ import {
 } from './helpers/renderCategories.js';
 import {
   saveCategoriesSession,
-  getCategorySsd,
+  getCategoryRecord,
   setUserVehicle,
   getUserVehicle,
   setCategoriesRoot,
@@ -344,7 +344,10 @@ export default class Bot {
       if (!ctx?.catalog) throw new Error('Контекст автомобиля не найден. Повтори VIN.');
       const { catalog, vehicleId } = ctx;
 
-      const ssd = await getCategorySsd(userId, catalog, vehicleId || '0', categoryId);
+      const category = await getCategoryRecord(userId, catalog, vehicleId || '0', categoryId);
+      const ssd = category?.ssd;
+      const canonicalCategoryId = category?.categoryId ?? categoryId;
+
       if (!ssd) throw new Error('Сессия категорий устарела. Повтори VIN.');
 
       const base = (process.env.LAXIMO_BASE_URL || '').replace(/\/+$/, '');
@@ -352,7 +355,7 @@ export default class Bot {
       uUrl.searchParams.set('catalog', catalog);
       uUrl.searchParams.set('vehicleId', vehicleId || '0');
       uUrl.searchParams.set('ssd', ssd);
-      uUrl.searchParams.set('categoryId', String(categoryId));
+      uUrl.searchParams.set('categoryId', String(canonicalCategoryId));
 
       const uRes = await fetch(uUrl.toString());
       const uJson = await uRes.json().catch(() => ({}));
