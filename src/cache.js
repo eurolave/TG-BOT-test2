@@ -61,19 +61,32 @@ export async function saveCategoriesSession(userId, catalog, vehicleId, rootArra
   if (r) await r.set(key, payload, { EX: ttlSec }); else memSet(key, payload, ttlSec);
 }
 
-/** Получить SSD по categoryId */
-export async function getCategorySsd(userId, catalog, vehicleId, categoryId) {
+async function readCategoriesSession(userId, catalog, vehicleId) {
   const key = `cats:${userId}:${catalog}:${vehicleId}`;
   const r = await getRedis();
-  let raw = r ? await r.get(key) : memGet(key);
+  const raw = r ? await r.get(key) : memGet(key);
   if (!raw) return null;
   try {
     const arr = JSON.parse(raw) || [];
-    const found = arr.find(x => String(x.categoryId) === String(categoryId));
-    return found?.ssd || null;
+    return Array.isArray(arr) ? arr : [];
   } catch {
-    return null;
+    return [];
   }
+}
+
+/** Получить полную запись категории по её идентификатору */
+export async function getCategoryRecord(userId, catalog, vehicleId, categoryId) {
+  const list = await readCategoriesSession(userId, catalog, vehicleId);
+  if (!Array.isArray(list)) return null;
+
+  const found = list.find(x => String(x?.categoryId) === String(categoryId));
+  return found ? { ...found } : null;
+}
+
+/** Получить SSD по categoryId (совместимость) */
+export async function getCategorySsd(userId, catalog, vehicleId, categoryId) {
+  const record = await getCategoryRecord(userId, catalog, vehicleId, categoryId);
+  return record?.ssd ?? null;
 }
 
 /** Храним текущий автомобиль (catalog, vehicleId, rootSsd) для пользователя */
