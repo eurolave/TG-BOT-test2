@@ -260,8 +260,8 @@ export default class Bot {
       
       
       // Кнопка «Перейти в каталог» (сообщение с NBSP, чтобы Telegram не счёл пустым)
-await this._safeSendMessage(chatId, '.', {
-        pparse_mode: 'HTML',
+      await this._safeSendMessage(chatId, '&nbsp;', {
+        parse_mode: 'HTML',
         disable_web_page_preview: true,
         reply_markup: {
           inline_keyboard: [[{ text: '📂 Перейти в каталог', callback_data: 'cats' }]]
