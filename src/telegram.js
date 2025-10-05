@@ -36,9 +36,8 @@ function replyMenu() {
   };
 }
 
-// Безопасное извлечение числа из callback_data вида unit:<id>[:<categoryId>]
+// Безопасное извлечение unitId/категории из callback_data вида unit:<id>[:<categoryId>]
 function parseUnitCbData(data) {
-  // допускаем unit:123 или node:123, и необязательный :<categoryId>
   const m = data.match(/^(?:unit|node):([^:]+)(?::([^:]+))?$/);
   if (!m) return null;
   return { unitId: String(m[1]), categoryId: m[2] ? String(m[2]) : undefined };
@@ -419,16 +418,27 @@ export default class Bot {
       const uJson = await uRes.json().catch(() => ({}));
       if (!uJson?.ok) throw new Error(uJson?.error || 'Не удалось получить состав узла');
 
-      const partsArr = Array.isArray(uJson.data) ? uJson.data
-        : (uJson.data?.parts || uJson.data?.Units || uJson.data?.unitParts || []);
+      // Гибкий экстрактор массивов деталей
+      const partsArr = extractPartsFlexible(uJson.data);
+
       if (!partsArr?.length) {
-        await this._safeSendMessage(chatId, `По узлу ${unitId} детали не найдены (ssd: ${ssd}).`);
+        // Диагностика: подскажем ключи верхнего уровня
+        const keys = uJson?.data && typeof uJson.data === 'object'
+          ? Object.keys(uJson.data).slice(0, 12).join(', ')
+          : (Array.isArray(uJson?.data) ? `Array(${uJson.data.length})` : typeof uJson?.data);
+        await this._safeSendMessage(
+          chatId,
+          [
+            `По узлу ${unitId} детали не найдены (ssd: ${ssd}).`,
+            keys ? `Ключи ответа: ${keys}` : ''
+          ].filter(Boolean).join('\n')
+        );
         return;
       }
 
       const lines = partsArr.slice(0, 30).map((p, i) => {
-        const name = p.name || p.partName || p.PartName || p.article || p.oem || '—';
-        const art  = p.article || p.oem || p.Oem || '';
+        const name = p.name || p.Name || p.partName || p.PartName || p.detailName || p.DetailName || p.article || p.oem || '—';
+        const art  = p.article || p.Article || p.oem || p.Oem || p.OEM || '';
         return `${i + 1}. ${name}${art ? ` (${art})` : ''}`;
       });
 
@@ -498,6 +508,53 @@ function ensureCategoryInUnitCallbacks(reply_markup, categoryId) {
     })
   );
   return { inline_keyboard: kb };
+}
+
+/** Гибкий экстрактор массива деталей из разных форматов ответа */
+function extractPartsFlexible(payload) {
+  if (Array.isArray(payload)) {
+    // возможные варианты: [unitInfo, unitParts], либо массив деталей напрямую
+    if (payload.length && typeof payload[0] === 'object' && !Array.isArray(payload[0])) {
+      // попробуем второй элемент как unitParts
+      const p2 = extractPartsFlexible(payload[1]);
+      if (p2.length) return p2;
+    }
+    // может быть, детали уже пришли массивом
+    return payload;
+  }
+  if (!payload || typeof payload !== 'object') return [];
+
+  const cands = [
+    payload.parts,
+    payload.unitParts?.parts,
+    payload.unitParts?.rows,
+    payload.UnitParts?.Parts,
+    payload.UnitParts?.Rows,
+    payload.positions,
+    payload.Positions,
+    payload.items,
+    payload.Items,
+    payload.rows,
+    payload.Rows,
+    payload.data?.parts,
+    payload.data?.unitParts?.parts,
+    payload.data?.rows
+  ].filter(Boolean);
+
+  for (const c of cands) {
+    if (Array.isArray(c) && c.length) return c;
+  }
+
+  // fallback: любой массив объектов, похожих на детали
+  for (const [, v] of Object.entries(payload)) {
+    if (Array.isArray(v) && v.length && typeof v[0] === 'object') {
+      const o = v[0];
+      if (('article' in o) || ('oem' in o) || ('name' in o) || ('partName' in o) || ('PartName' in o)) {
+        return v;
+      }
+    }
+  }
+  return [];
 }
 
 function extractRoot(categoriesRoot) {
