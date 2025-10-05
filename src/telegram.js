@@ -141,6 +141,9 @@ export default class Bot {
     this.bot.on('callback_query', async (q) => {
       const data = q.data || '';
 
+      // Сразу снимаем «часики», чтобы у пользователя не висело ожидание
+      await this.bot.answerCallbackQuery(q.id).catch(() => {});
+
       // 1) Нажали «Категории» — грузим с API и обновляем кэш
       if (data === 'cats') {
         await this._handleLoadCategories(q);
@@ -149,7 +152,6 @@ export default class Bot {
 
       // 1.1) Нажали «Обновить» — рисуем из кэша, без похода в API
       if (data === 'cats_cache') {
-        await this.bot.answerCallbackQuery(q.id).catch(() => {});
         const chatId = q.message?.chat?.id;
         const userId = q.from?.id;
         if (!chatId || !userId) return;
@@ -185,9 +187,15 @@ export default class Bot {
         return;
       }
 
+      // 2.1) Выбор узла (поддержка unit: и node:)
+      if (/^(unit|node):/.test(data)) {
+        const unitId = data.split(':')[1];
+        await this._handleUnit(q, unitId);
+        return;
+      }
+
       // 3) Пагинация категорий (из кэша)
       if (data.startsWith('noop:page:')) {
-        await this.bot.answerCallbackQuery(q.id).catch(() => {});
         const chatId = q.message?.chat?.id;
         const userId = q.from?.id;
         if (!chatId || !userId) return;
@@ -221,8 +229,16 @@ export default class Bot {
 
       // 4) Прочие noop
       if (data.startsWith('noop:')) {
-        await this.bot.answerCallbackQuery(q.id).catch(() => {});
+        return;
       }
+
+      // 5) Неизвестные нажатия — лог и мягкое сообщение (чтобы не «молчало»)
+      try {
+        const chatId = q.message?.chat?.id;
+        if (chatId) {
+          await this._safeSendMessage(chatId, `Неизвестная кнопка: ${data}`);
+        }
+      } catch {}
     });
   }
 
@@ -257,8 +273,6 @@ export default class Bot {
       const rootSsd = vehicle.ssd;
       await setUserVehicle(userId, { catalog, vehicleId, rootSsd });
 
-      
-      
       // Кнопка «Перейти в каталог» (сообщение с NBSP, чтобы Telegram не счёл пустым)
       await this._safeSendMessage(chatId, '&nbsp;', {
         parse_mode: 'HTML',
@@ -282,12 +296,10 @@ export default class Bot {
     const chatId = q.message?.chat?.id;
     const userId = q.from?.id;
     if (!chatId || !userId) {
-      await this.bot.answerCallbackQuery(q.id).catch(() => {});
       return;
     }
 
     try {
-      await this.bot.answerCallbackQuery(q.id, { text: 'Загружаю категории…' }).catch(() => {});
       const ctx = await getUserVehicle(userId);
       if (!ctx?.catalog || !ctx?.rootSsd) throw new Error('Контекст VIN устарел. Повтори VIN.');
 
@@ -333,13 +345,10 @@ export default class Bot {
     const chatId = q.message?.chat?.id;
     const userId = q.from?.id;
     if (!chatId || !userId) {
-      await this.bot.answerCallbackQuery(q.id).catch(() => {});
       return;
     }
 
     try {
-      await this.bot.answerCallbackQuery(q.id, { text: 'Загружаю узлы…' }).catch(() => {});
-
       const ctx = await getUserVehicle(userId);
       if (!ctx?.catalog) throw new Error('Контекст автомобиля не найден. Повтори VIN.');
       const { catalog, vehicleId } = ctx;
@@ -375,6 +384,63 @@ export default class Bot {
         chatId,
         `Не удалось получить узлы: <code>${escapeHtml(String(e?.message || e))}</code>`,
         { parse_mode: 'HTML', reply_markup: replyMenu() }
+      );
+    }
+  }
+
+  /** Шаг 4: Детали/состав по узлу */
+  async _handleUnit(q, unitId) {
+    const chatId = q.message?.chat?.id;
+    const userId = q.from?.id;
+    if (!chatId || !userId) return;
+
+    try {
+      await this.bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+      const ctx = await getUserVehicle(userId);
+      if (!ctx?.catalog) throw new Error('Контекст автомобиля не найден. Повтори VIN.');
+
+      const { catalog, vehicleId } = ctx;
+      const base = (process.env.LAXIMO_BASE_URL || '').replace(/\/+$/, '');
+      if (!base) throw new Error('Не настроен LAXIMO_BASE_URL');
+
+      // ⚠️ Подставьте корректный эндпоинт вашего бэкенда:
+      // варианты: /unit, /unitParts, /parts, /graph — зависит от Laximo-Connect-2.0
+      const uUrl = new URL(base + '/unit');
+      uUrl.searchParams.set('catalog', catalog);
+      uUrl.searchParams.set('vehicleId', vehicleId || '0');
+      uUrl.searchParams.set('unitId', String(unitId));
+
+      const uRes = await fetch(uUrl.toString());
+      const uJson = await uRes.json().catch(() => ({}));
+      if (!uJson?.ok) throw new Error(uJson?.error || 'Не удалось получить состав узла');
+
+      // Нормализация ответа под ваш формат
+      const parts = Array.isArray(uJson.data) ? uJson.data : (uJson.data?.parts || []);
+      if (!parts?.length) {
+        await this._safeSendMessage(chatId, `По узлу ${unitId} детали не найдены.`);
+        return;
+      }
+
+      // Сформируем простой список (до 30 строк, чтобы не заспамить)
+      const lines = parts.slice(0, 30).map((p, i) => {
+        const name = p.name || p.partName || p.article || '—';
+        const art  = p.article || p.oem || '';
+        return `${i + 1}. ${name}${art ? ` (${art})` : ''}`;
+      });
+
+      await this._safeSendMessage(chatId, [
+        `🔩 Узел: ${unitId}`,
+        '',
+        lines.join('\n'),
+        parts.length > 30 ? `… и ещё ${parts.length - 30}` : ''
+      ].join('\n'), { disable_web_page_preview: true });
+
+    } catch (e) {
+      await this._safeSendMessage(
+        chatId,
+        `Не удалось получить состав узла: <code>${escapeHtml(String(e?.message || e))}</code>`,
+        { parse_mode: 'HTML' }
       );
     }
   }
