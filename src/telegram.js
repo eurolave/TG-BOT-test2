@@ -36,11 +36,54 @@ function replyMenu() {
   };
 }
 
-// Безопасное извлечение unitId/категории из callback_data вида unit:<id>[:<categoryId>]
+// Безопасное извлечение из callback_data вида unit:<id>[:<categoryId>]
 function parseUnitCbData(data) {
+  // поддерживаем unit: и node:
   const m = data.match(/^(?:unit|node):([^:]+)(?::([^:]+))?$/);
   if (!m) return null;
   return { unitId: String(m[1]), categoryId: m[2] ? String(m[2]) : undefined };
+}
+
+// Помощник: делаем ссылки на картинки из шаблона imageUrl
+function buildUnitImageLinks(imageUrlRaw = '') {
+  const imageUrl = String(imageUrlRaw || '').trim();
+  if (!imageUrl) return null;
+  const hasSize = imageUrl.includes('%size%');
+  const preview = hasSize ? imageUrl.replace('%size%', '250')    : imageUrl;
+  const large   = hasSize ? imageUrl.replace('%size%', '1200')   : imageUrl;
+  const source  = hasSize ? imageUrl.replace('%size%', 'source') : imageUrl;
+  return { preview, large, source };
+}
+
+// Универсальный парсер состава узла
+function extractUnitParts(payload) {
+  if (!payload) return [];
+
+  const tryArr = (v) => Array.isArray(v) ? v : (v ? [v] : []);
+
+  const data = payload;
+
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      if (Array.isArray(item?.parts)) return item.parts;
+      if (Array.isArray(item?.unit?.parts)) return item.unit.parts;
+      if (Array.isArray(item?.UnitParts)) return item.UnitParts;
+      if (Array.isArray(item?.Units?.[0]?.UnitParts)) return item.Units[0].UnitParts;
+      if (Array.isArray(item?.Units?.UnitParts)) return item.Units.UnitParts;
+      const up = item?.UnitParts ?? item?.unitParts;
+      if (up?.Part) return tryArr(up.Part);
+    }
+  } else if (typeof data === 'object') {
+    if (Array.isArray(data.parts)) return data.parts;
+    if (Array.isArray(data?.unit?.parts)) return data.unit.parts;
+    if (Array.isArray(data.UnitParts)) return data.UnitParts;
+    if (Array.isArray(data?.Units?.[0]?.UnitParts)) return data.Units[0].UnitParts;
+    if (Array.isArray(data?.Units?.UnitParts)) return data.Units.UnitParts;
+    const up = data?.UnitParts ?? data?.unitParts;
+    if (up?.Part) return tryArr(up.Part);
+  }
+
+  return [];
 }
 
 export default class Bot {
@@ -202,6 +245,16 @@ export default class Bot {
         return;
       }
 
+      // 2.2) Фото узла
+      if (data.startsWith('photo:')) {
+        const m = data.match(/^photo:([^:]+)(?::([^:]+))?$/);
+        if (!m) return;
+        const unitId = String(m[1]);
+        const categoryId = m[2] ? String(m[2]) : undefined;
+        await this._handleUnitPhoto(q, unitId, categoryId);
+        return;
+      }
+
       // 3) Пагинация категорий (из кэша)
       if (data.startsWith('noop:page:')) {
         const chatId = q.message?.chat?.id;
@@ -356,14 +409,14 @@ export default class Bot {
       const data0 = Array.isArray(uJson.data) ? uJson.data[0] : (uJson.data || {});
       const units = data0.units || data0?.saaUnits || data0?.unit || [];
 
-      // Сохраним узлы по категории (unitId -> {ssd, ...})
+      // Сохраним узлы по категории (unitId -> {ssd, code, imageUrl, ...})
       await saveUnitsSession(userId, catalog, vehicleId || '0', String(canonicalCategoryId), units);
       await setLastCategory(userId, catalog, vehicleId || '0', String(canonicalCategoryId));
 
       // Рендер списка узлов
       const msg = renderUnitsList(units);
 
-      // Гарантируем, что в callback_data у кнопок узлов есть categoryId (unit:<id>:<catId>)
+      // Убедимся, что в callback_data у кнопок узлов есть categoryId (unit:<id>:<catId>)
       const patchedMarkup = ensureCategoryInUnitCallbacks(msg.reply_markup, String(canonicalCategoryId));
 
       await this._safeSendMessage(chatId, msg.text, {
@@ -418,41 +471,104 @@ export default class Bot {
       const uJson = await uRes.json().catch(() => ({}));
       if (!uJson?.ok) throw new Error(uJson?.error || 'Не удалось получить состав узла');
 
-      // Гибкий экстрактор массивов деталей
-      const partsArr = extractPartsFlexible(uJson.data);
-
-      if (!partsArr?.length) {
-        // Диагностика: подскажем ключи верхнего уровня
-        const keys = uJson?.data && typeof uJson.data === 'object'
-          ? Object.keys(uJson.data).slice(0, 12).join(', ')
-          : (Array.isArray(uJson?.data) ? `Array(${uJson.data.length})` : typeof uJson?.data);
+      const partsArr = extractUnitParts(uJson.data);
+      if (!partsArr.length) {
+        const keysHint = uJson?.data && typeof uJson.data === 'object'
+          ? Object.keys(uJson.data).join(', ')
+          : Array.isArray(uJson?.data) ? 'array' : typeof uJson?.data;
         await this._safeSendMessage(
           chatId,
-          [
-            `По узлу ${unitId} детали не найдены (ssd: ${ssd}).`,
-            keys ? `Ключи ответа: ${keys}` : ''
-          ].filter(Boolean).join('\n')
+          `По узлу ${unitId} детали не найдены (ssd: ${ssd}).\nКлючи ответа: ${keysHint}`
         );
         return;
       }
 
       const lines = partsArr.slice(0, 30).map((p, i) => {
-        const name = p.name || p.Name || p.partName || p.PartName || p.detailName || p.DetailName || p.article || p.oem || '—';
-        const art  = p.article || p.Article || p.oem || p.Oem || p.OEM || '';
+        const name = p.name || p.partName || p.PartName || p.article || p.oem || '—';
+        const art  = p.article || p.oem || p.Oem || '';
         return `${i + 1}. ${name}${art ? ` (${art})` : ''}`;
       });
 
+      // Кнопки: Фото (если есть картинка), Открыть узел (в вашу веб-морду), Навигация
+      const kbRows = [];
+      if (rec?.imageUrl) {
+        kbRows.push([{ text: '🖼 Фото узла', callback_data: `photo:${unitId}:${categoryId}` }]);
+      }
+      // Пример ссылки "Открыть узел" — адаптируйте под вашу веб-морду:
+      const openUrl = `${base}/units?catalog=${encodeURIComponent(catalog)}&vehicleId=${encodeURIComponent(vehicleId || '0')}&ssd=${encodeURIComponent(ssd)}&categoryId=${encodeURIComponent(categoryId)}#unit=${encodeURIComponent(unitId)}`;
+      kbRows.push([{ text: '🔗 Открыть узел', url: openUrl }]);
+
       await this._safeSendMessage(chatId, [
-        `🔩 Узел: ${unitId}`,
+        `🔩 Узел: <b>${escapeHtml(rec?.name || String(unitId))}</b>${rec?.code ? `\n<code>${escapeHtml(rec.code)}</code>` : ''}`,
         '',
         lines.join('\n'),
         partsArr.length > 30 ? `… и ещё ${partsArr.length - 30}` : ''
-      ].join('\n'), { disable_web_page_preview: true });
+      ].join('\n'), {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: kbRows }
+      });
 
     } catch (e) {
       await this._safeSendMessage(
         chatId,
         `Не удалось получить состав узла: <code>${escapeHtml(String(e?.message || e))}</code>`,
+        { parse_mode: 'HTML' }
+      );
+    }
+  }
+
+  /** Фото узла: превью + кнопки 1200px / Оригинал / Назад */
+  async _handleUnitPhoto(q, unitId, categoryIdFromCb) {
+    const chatId = q.message?.chat?.id;
+    const userId = q.from?.id;
+    if (!chatId || !userId) return;
+
+    try {
+      await this.bot.sendChatAction(chatId, 'upload_photo').catch(() => {});
+      const ctx = await getUserVehicle(userId);
+      if (!ctx?.catalog) throw new Error('Контекст автомобиля не найден. Повтори VIN.');
+
+      const { catalog, vehicleId } = ctx;
+
+      // Понимаем категорию: из callback_data или последняя
+      let categoryId = categoryIdFromCb;
+      if (!categoryId) categoryId = await getLastCategory(userId, catalog, vehicleId || '0');
+      if (!categoryId) throw new Error('Не удалось определить категорию. Откройте категории заново.');
+
+      // Берём узел из кэша (там есть imageUrl и code после фикса normalizeUnit)
+      const rec = await getUnitRecord(userId, catalog, vehicleId || '0', String(categoryId), String(unitId));
+      if (!rec) throw new Error('Узел не найден в кэше. Перезагрузите категории.');
+      const links = buildUnitImageLinks(rec.imageUrl);
+      if (!links) throw new Error('Нет ссылки на изображение узла.');
+
+      const caption = [
+        `🖼 <b>${escapeHtml(rec.name || 'Узел')}</b>`,
+        rec.code ? `<code>${escapeHtml(rec.code)}</code>` : ''
+      ].filter(Boolean).join('\n');
+
+      const kb = {
+        inline_keyboard: [
+          [
+            { text: '1200 px', url: links.large },
+            { text: 'Оригинал', url: links.source },
+          ],
+          [
+            { text: '⬅️ Назад', callback_data: `unit:${unitId}:${categoryId}` },
+          ]
+        ]
+      };
+
+      await this.bot.sendPhoto(chatId, links.preview, {
+        caption,
+        parse_mode: 'HTML',
+        reply_markup: kb
+      });
+
+    } catch (e) {
+      await this._safeSendMessage(
+        chatId,
+        `Не удалось показать фото: <code>${escapeHtml(String(e?.message || e))}</code>`,
         { parse_mode: 'HTML' }
       );
     }
@@ -508,53 +624,6 @@ function ensureCategoryInUnitCallbacks(reply_markup, categoryId) {
     })
   );
   return { inline_keyboard: kb };
-}
-
-/** Гибкий экстрактор массива деталей из разных форматов ответа */
-function extractPartsFlexible(payload) {
-  if (Array.isArray(payload)) {
-    // возможные варианты: [unitInfo, unitParts], либо массив деталей напрямую
-    if (payload.length && typeof payload[0] === 'object' && !Array.isArray(payload[0])) {
-      // попробуем второй элемент как unitParts
-      const p2 = extractPartsFlexible(payload[1]);
-      if (p2.length) return p2;
-    }
-    // может быть, детали уже пришли массивом
-    return payload;
-  }
-  if (!payload || typeof payload !== 'object') return [];
-
-  const cands = [
-    payload.parts,
-    payload.unitParts?.parts,
-    payload.unitParts?.rows,
-    payload.UnitParts?.Parts,
-    payload.UnitParts?.Rows,
-    payload.positions,
-    payload.Positions,
-    payload.items,
-    payload.Items,
-    payload.rows,
-    payload.Rows,
-    payload.data?.parts,
-    payload.data?.unitParts?.parts,
-    payload.data?.rows
-  ].filter(Boolean);
-
-  for (const c of cands) {
-    if (Array.isArray(c) && c.length) return c;
-  }
-
-  // fallback: любой массив объектов, похожих на детали
-  for (const [, v] of Object.entries(payload)) {
-    if (Array.isArray(v) && v.length && typeof v[0] === 'object') {
-      const o = v[0];
-      if (('article' in o) || ('oem' in o) || ('name' in o) || ('partName' in o) || ('PartName' in o)) {
-        return v;
-      }
-    }
-  }
-  return [];
 }
 
 function extractRoot(categoriesRoot) {
