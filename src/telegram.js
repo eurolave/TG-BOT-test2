@@ -44,15 +44,16 @@ function parseUnitCbData(data) {
   return { unitId: String(m[1]), categoryId: m[2] ? String(m[2]) : undefined };
 }
 
-// Помощник: делаем ссылки на картинки из шаблона imageUrl
+
+// ─── стало: всегда возвращаем source
 function buildUnitImageLinks(imageUrlRaw = '') {
   const imageUrl = String(imageUrlRaw || '').trim();
   if (!imageUrl) return null;
-  const hasSize = imageUrl.includes('%size%');
-  const preview = hasSize ? imageUrl.replace('%size%', '250')    : imageUrl;
-  const large   = hasSize ? imageUrl.replace('%size%', '1200')   : imageUrl;
-  const source  = hasSize ? imageUrl.replace('%size%', 'source') : imageUrl;
-  return { preview, large, source };
+  const source = imageUrl.includes('%size%')
+    ? imageUrl.replace('%size%', 'source')
+    : imageUrl;
+  // используем source и как превью (фотка для sendPhoto), и как открывающуюся ссылку
+  return { preview: source, source };
 }
 
 // Универсальный парсер состава узла
@@ -548,16 +549,15 @@ export default class Bot {
       ].filter(Boolean).join('\n');
 
       const kb = {
-        inline_keyboard: [
-          [
-            { text: '1200 px', url: links.large },
-            { text: 'Оригинал', url: links.source },
-          ],
-          [
-            { text: '⬅️ Назад', callback_data: `unit:${unitId}:${categoryId}` },
-          ]
-        ]
-      };
+  inline_keyboard: [
+    [
+      { text: 'Открыть изображение', url: links.source },
+    ],
+    [
+      { text: '⬅️ Назад', callback_data: `unit:${unitId}:${categoryId}` },
+    ]
+  ]
+};
 
       await this.bot.sendPhoto(chatId, links.preview, {
         caption,
