@@ -51,7 +51,8 @@ function normalizeUnit(u = {}) {
   const name     = u.name   ?? u.UnitName ?? u.title ?? '';
   const ssd      = u.ssd    ?? u.SSD ?? u.Ssd ?? u.sSd ?? null;
   const code     = u.code   ?? u.UnitCode ?? u.Code ?? null;
-  const imageUrl = u.imageUrl ?? u.ImageUrl ?? u.img ?? null;
+  const imageRaw = u.imageUrl ?? u.ImageUrl ?? u.img ?? null;
+  const imageUrl = imageRaw ? String(imageRaw).replace('%size%', 'source') : null; // ВСЕГДА source
 
   return {
     unitId: unitId != null ? String(unitId) : null,
@@ -117,32 +118,53 @@ export async function getCategoriesRoot(userId, catalog, vehicleId) {
 }
 
 /** ───────── High-level API: узлы (units) ─────────
- *  Сохраняем по ключу user+catalog+vehicle+category -> Map(unitId -> {unitId, name, ssd, ...})
+ *  Сохраняем { order: [unitId...], byId: {unitId -> {unitId, name, ssd, imageUrl, code}} }
  */
 export async function saveUnitsSession(userId, catalog, vehicleId, categoryId, unitsArray, ttlSec = TTL_UNITS) {
   const key = `units:${userId}:${catalog}:${vehicleId}:${categoryId}`;
-  const map = {};
+  const order = [];
+  const byId = {};
   for (const u of (unitsArray || [])) {
     const nu = normalizeUnit(u);
-    if (nu.unitId) map[nu.unitId] = nu;
+    if (!nu.unitId) continue;
+    order.push(nu.unitId);
+    byId[nu.unitId] = nu;
   }
   const r = await getRedis();
-  const payload = JSON.stringify(map);
+  const payload = JSON.stringify({ order, byId });
   if (r) await r.set(key, payload, { EX: ttlSec }); else memSet(key, payload, ttlSec);
 }
 
-export async function getUnitRecord(userId, catalog, vehicleId, categoryId, unitId) {
+async function readUnitsBundle(userId, catalog, vehicleId, categoryId) {
   const key = `units:${userId}:${catalog}:${vehicleId}:${categoryId}`;
   const r = await getRedis();
   const raw = r ? await r.get(key) : memGet(key);
   if (!raw) return null;
   try {
-    const obj = JSON.parse(raw) || {};
-    const rec = obj[String(unitId)];
-    return rec || null;
+    const parsed = JSON.parse(raw) || {};
+    return { order: Array.isArray(parsed.order) ? parsed.order : [], byId: parsed.byId || {} };
   } catch {
     return null;
   }
+}
+
+export async function getUnitRecord(userId, catalog, vehicleId, categoryId, unitId) {
+  const bundle = await readUnitsBundle(userId, catalog, vehicleId, categoryId);
+  if (!bundle) return null;
+  return bundle.byId?.[String(unitId)] ?? null;
+}
+
+export async function getUnitsOrder(userId, catalog, vehicleId, categoryId) {
+  const bundle = await readUnitsBundle(userId, catalog, vehicleId, categoryId);
+  return bundle?.order ?? [];
+}
+
+export async function getNextUnitId(userId, catalog, vehicleId, categoryId, currentUnitId) {
+  const order = await getUnitsOrder(userId, catalog, vehicleId, categoryId);
+  if (!order.length) return null;
+  const i = order.indexOf(String(currentUnitId));
+  const nextIdx = (i >= 0 ? i + 1 : 0) % order.length;
+  return order[nextIdx] ?? null;
 }
 
 /** Опционально: хранить «последнюю выбранную категорию» для пользователя */
