@@ -6,13 +6,19 @@ import {
   renderCategoriesList,
   renderUnitsList
 } from './helpers/renderCategories.js';
+
 import {
   saveCategoriesSession,
   getCategoryRecord,
   setUserVehicle,
   getUserVehicle,
   setCategoriesRoot,
-  getCategoriesRoot
+  getCategoriesRoot,
+  // новые:
+  saveUnitsSession,
+  getUnitRecord,
+  setLastCategory,
+  getLastCategory
 } from './cache.js';
 
 // ─────────────────────── UI: Reply keyboard ───────────────────────
@@ -28,6 +34,14 @@ function replyMenu() {
       [{ text: BTN_RESET }],
     ],
   };
+}
+
+// Безопасное извлечение числа из callback_data вида unit:<id>[:<categoryId>]
+function parseUnitCbData(data) {
+  // допускаем unit:123 или node:123, и необязательный :<categoryId>
+  const m = data.match(/^(?:unit|node):([^:]+)(?::([^:]+))?$/);
+  if (!m) return null;
+  return { unitId: String(m[1]), categoryId: m[2] ? String(m[2]) : undefined };
 }
 
 export default class Bot {
@@ -134,23 +148,22 @@ export default class Bot {
         return;
       }
 
-      // Остальное игнорируем, чтобы не засорять чат
+      // Остальное игнорируем
     });
 
     // ───────────── callback_query ─────────────
     this.bot.on('callback_query', async (q) => {
       const data = q.data || '';
-
-      // Сразу снимаем «часики», чтобы у пользователя не висело ожидание
+      // снимем «часики»
       await this.bot.answerCallbackQuery(q.id).catch(() => {});
 
-      // 1) Нажали «Категории» — грузим с API и обновляем кэш
+      // 1) «Категории» — загрузка с API
       if (data === 'cats') {
         await this._handleLoadCategories(q);
         return;
       }
 
-      // 1.1) Нажали «Обновить» — рисуем из кэша, без похода в API
+      // 1.1) «Обновить» — из кэша
       if (data === 'cats_cache') {
         const chatId = q.message?.chat?.id;
         const userId = q.from?.id;
@@ -164,18 +177,10 @@ export default class Bot {
         }
 
         const msg = renderCategoriesList(catsRoot, 0);
-        await this.bot.editMessageText(msg.text, {
-          chat_id: chatId,
-          message_id: q.message.message_id,
+        await this._editOrSend(chatId, q.message?.message_id, msg.text, {
           parse_mode: msg.parse_mode,
           reply_markup: addCatsFooter(msg.reply_markup),
           disable_web_page_preview: msg.disable_web_page_preview,
-        }).catch(async () => {
-          await this._safeSendMessage(chatId, msg.text, {
-            parse_mode: msg.parse_mode,
-            reply_markup: addCatsFooter(msg.reply_markup),
-            disable_web_page_preview: msg.disable_web_page_preview,
-          });
         });
         return;
       }
@@ -189,8 +194,12 @@ export default class Bot {
 
       // 2.1) Выбор узла (поддержка unit: и node:)
       if (/^(unit|node):/.test(data)) {
-        const unitId = data.split(':')[1];
-        await this._handleUnit(q, unitId);
+        const parsed = parseUnitCbData(data);
+        if (!parsed?.unitId) {
+          await this._safeSendMessage(q.message?.chat?.id, `Не удалось распарсить кнопку: ${data}`);
+          return;
+        }
+        await this._handleUnit(q, parsed.unitId, parsed.categoryId);
         return;
       }
 
@@ -211,34 +220,20 @@ export default class Bot {
         const page = Number(pageStr) || 0;
         const msg = renderCategoriesList(catsRoot, page);
 
-        await this.bot.editMessageText(msg.text, {
-          chat_id: chatId,
-          message_id: q.message.message_id,
+        await this._editOrSend(chatId, q.message?.message_id, msg.text, {
           parse_mode: msg.parse_mode,
           reply_markup: addCatsFooter(msg.reply_markup),
           disable_web_page_preview: msg.disable_web_page_preview,
-        }).catch(async () => {
-          await this._safeSendMessage(chatId, msg.text, {
-            parse_mode: msg.parse_mode,
-            reply_markup: addCatsFooter(msg.reply_markup),
-            disable_web_page_preview: msg.disable_web_page_preview,
-          });
         });
         return;
       }
 
       // 4) Прочие noop
-      if (data.startsWith('noop:')) {
-        return;
-      }
+      if (data.startsWith('noop:')) return;
 
-      // 5) Неизвестные нажатия — лог и мягкое сообщение (чтобы не «молчало»)
-      try {
-        const chatId = q.message?.chat?.id;
-        if (chatId) {
-          await this._safeSendMessage(chatId, `Неизвестная кнопка: ${data}`);
-        }
-      } catch {}
+      // 5) Неизвестно
+      const chatId = q.message?.chat?.id;
+      if (chatId) await this._safeSendMessage(chatId, `Неизвестная кнопка: ${data}`);
     });
   }
 
@@ -263,17 +258,14 @@ export default class Bot {
       const vehicle = j.data?.[0]?.vehicles?.[0];
       if (!vehicle) throw new Error('В ответе нет данных автомобиля');
 
-      // Шапка (без тех.полей) — реализовано в renderVehicleHeader
       const header = renderVehicleHeader(vehicle);
       await this._safeSendMessage(chatId, header, { parse_mode: 'HTML', reply_markup: replyMenu() });
 
-      // Сохраняем контекст (catalog, vehicleId, rootSsd)
       const catalog = vehicle.catalog;
       const vehicleId = vehicle.vehicleId || '0';
       const rootSsd = vehicle.ssd;
       await setUserVehicle(userId, { catalog, vehicleId, rootSsd });
 
-      // Кнопка «Перейти в каталог» (сообщение с NBSP, чтобы Telegram не счёл пустым)
       await this._safeSendMessage(chatId, '&nbsp;', {
         parse_mode: 'HTML',
         disable_web_page_preview: true,
@@ -295,9 +287,7 @@ export default class Bot {
   async _handleLoadCategories(q) {
     const chatId = q.message?.chat?.id;
     const userId = q.from?.id;
-    if (!chatId || !userId) {
-      return;
-    }
+    if (!chatId || !userId) return;
 
     try {
       const ctx = await getUserVehicle(userId);
@@ -316,15 +306,11 @@ export default class Bot {
       if (!cJson?.ok) throw new Error(cJson?.error || 'Не удалось получить категории');
 
       const categoriesRoot = cJson.data;
-      const root = extractRoot(categoriesRoot); // массив корня в «как пришло»
+      const root = extractRoot(categoriesRoot);
 
-      // сохраняем соответствие id→ssd (для перехода в узлы)
       await saveCategoriesSession(userId, catalog, vehicleId || '0', root);
-
-      // сохраняем ПОЛНУЮ структуру категорий, чтобы рисовать «Обновить» и пагинацию из кэша
       await setCategoriesRoot(userId, catalog, vehicleId || '0', categoriesRoot);
 
-      // рендер (как пришло) + кнопки «Обновить/Перезагрузить»
       const msg = renderCategoriesList(categoriesRoot);
       await this._safeSendMessage(chatId, msg.text, {
         parse_mode: msg.parse_mode,
@@ -344,9 +330,7 @@ export default class Bot {
   async _handleCategory(q, categoryId) {
     const chatId = q.message?.chat?.id;
     const userId = q.from?.id;
-    if (!chatId || !userId) {
-      return;
-    }
+    if (!chatId || !userId) return;
 
     try {
       const ctx = await getUserVehicle(userId);
@@ -373,10 +357,19 @@ export default class Bot {
       const data0 = Array.isArray(uJson.data) ? uJson.data[0] : (uJson.data || {});
       const units = data0.units || data0?.saaUnits || data0?.unit || [];
 
+      // Сохраним узлы по категории (unitId -> {ssd, ...})
+      await saveUnitsSession(userId, catalog, vehicleId || '0', String(canonicalCategoryId), units);
+      await setLastCategory(userId, catalog, vehicleId || '0', String(canonicalCategoryId));
+
+      // Рендер списка узлов
       const msg = renderUnitsList(units);
+
+      // Гарантируем, что в callback_data у кнопок узлов есть categoryId (unit:<id>:<catId>)
+      const patchedMarkup = ensureCategoryInUnitCallbacks(msg.reply_markup, String(canonicalCategoryId));
+
       await this._safeSendMessage(chatId, msg.text, {
         parse_mode: msg.parse_mode,
-        reply_markup: msg.reply_markup,
+        reply_markup: patchedMarkup,
         disable_web_page_preview: msg.disable_web_page_preview,
       });
     } catch (e) {
@@ -389,43 +382,53 @@ export default class Bot {
   }
 
   /** Шаг 4: Детали/состав по узлу */
-  async _handleUnit(q, unitId) {
+  async _handleUnit(q, unitId, categoryIdFromCb) {
     const chatId = q.message?.chat?.id;
     const userId = q.from?.id;
     if (!chatId || !userId) return;
 
     try {
       await this.bot.sendChatAction(chatId, 'typing').catch(() => {});
-
       const ctx = await getUserVehicle(userId);
       if (!ctx?.catalog) throw new Error('Контекст автомобиля не найден. Повтори VIN.');
 
       const { catalog, vehicleId } = ctx;
+
+      // Определим categoryId: либо из callback_data, либо «последняя выбранная»
+      let categoryId = categoryIdFromCb;
+      if (!categoryId) {
+        categoryId = await getLastCategory(userId, catalog, vehicleId || '0');
+      }
+      if (!categoryId) throw new Error('Не удалось определить категорию. Откройте категории заново.');
+
+      // Достанем узел из кэша и возьмём ssd
+      const rec = await getUnitRecord(userId, catalog, vehicleId || '0', String(categoryId), String(unitId));
+      const ssd = rec?.ssd;
+      if (!ssd) throw new Error('Не найден ssd узла в сессии. Перезагрузите категории.');
+
       const base = (process.env.LAXIMO_BASE_URL || '').replace(/\/+$/, '');
       if (!base) throw new Error('Не настроен LAXIMO_BASE_URL');
 
-      // ⚠️ Подставьте корректный эндпоинт вашего бэкенда:
-      // варианты: /unit, /unitParts, /parts, /graph — зависит от Laximo-Connect-2.0
+      // Правильный вызов: по ssd узла
       const uUrl = new URL(base + '/unit');
       uUrl.searchParams.set('catalog', catalog);
       uUrl.searchParams.set('vehicleId', vehicleId || '0');
-      uUrl.searchParams.set('unitId', String(unitId));
+      uUrl.searchParams.set('ssd', String(ssd));
 
       const uRes = await fetch(uUrl.toString());
       const uJson = await uRes.json().catch(() => ({}));
       if (!uJson?.ok) throw new Error(uJson?.error || 'Не удалось получить состав узла');
 
-      // Нормализация ответа под ваш формат
-      const parts = Array.isArray(uJson.data) ? uJson.data : (uJson.data?.parts || []);
-      if (!parts?.length) {
-        await this._safeSendMessage(chatId, `По узлу ${unitId} детали не найдены.`);
+      const partsArr = Array.isArray(uJson.data) ? uJson.data
+        : (uJson.data?.parts || uJson.data?.Units || uJson.data?.unitParts || []);
+      if (!partsArr?.length) {
+        await this._safeSendMessage(chatId, `По узлу ${unitId} детали не найдены (ssd: ${ssd}).`);
         return;
       }
 
-      // Сформируем простой список (до 30 строк, чтобы не заспамить)
-      const lines = parts.slice(0, 30).map((p, i) => {
-        const name = p.name || p.partName || p.article || '—';
-        const art  = p.article || p.oem || '';
+      const lines = partsArr.slice(0, 30).map((p, i) => {
+        const name = p.name || p.partName || p.PartName || p.article || p.oem || '—';
+        const art  = p.article || p.oem || p.Oem || '';
         return `${i + 1}. ${name}${art ? ` (${art})` : ''}`;
       });
 
@@ -433,7 +436,7 @@ export default class Bot {
         `🔩 Узел: ${unitId}`,
         '',
         lines.join('\n'),
-        parts.length > 30 ? `… и ещё ${parts.length - 30}` : ''
+        partsArr.length > 30 ? `… и ещё ${partsArr.length - 30}` : ''
       ].join('\n'), { disable_web_page_preview: true });
 
     } catch (e) {
@@ -442,6 +445,14 @@ export default class Bot {
         `Не удалось получить состав узла: <code>${escapeHtml(String(e?.message || e))}</code>`,
         { parse_mode: 'HTML' }
       );
+    }
+  }
+
+  async _editOrSend(chatId, messageId, text, opts) {
+    try {
+      await this.bot.editMessageText(text, { chat_id: chatId, message_id: messageId, ...opts });
+    } catch {
+      await this._safeSendMessage(chatId, text, opts);
     }
   }
 
@@ -469,6 +480,23 @@ function addCatsFooter(reply_markup) {
     { text: '🔁 Обновить', callback_data: 'cats_cache' },
     { text: '🔄 Перезагрузить', callback_data: 'cats' },
   ]);
+  return { inline_keyboard: kb };
+}
+
+/** Убедиться, что у кнопок узлов есть categoryId в callback_data: unit:<uid>:<catId> */
+function ensureCategoryInUnitCallbacks(reply_markup, categoryId) {
+  if (!reply_markup?.inline_keyboard) return reply_markup;
+  const kb = reply_markup.inline_keyboard.map(row =>
+    row.map(btn => {
+      if (!btn?.callback_data) return btn;
+      const m = btn.callback_data.match(/^(unit|node):([^:]+)(?::([^:]+))?$/);
+      if (!m) return btn;
+      if (m[3]) return btn; // уже есть categoryId
+      const prefix = m[1];
+      const uid = m[2];
+      return { ...btn, callback_data: `${prefix}:${uid}:${categoryId}` };
+    })
+  );
   return { inline_keyboard: kb };
 }
 
