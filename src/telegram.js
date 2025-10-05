@@ -18,7 +18,8 @@ import {
   saveUnitsSession,
   getUnitRecord,
   setLastCategory,
-  getLastCategory
+  getLastCategory,
+  getNextUnitId
 } from './cache.js';
 
 // ─────────────────────── UI: Reply keyboard ───────────────────────
@@ -36,23 +37,28 @@ function replyMenu() {
   };
 }
 
-// Безопасное извлечение из callback_data вида unit:<id>[:<categoryId>]
+// Универсальный парсер callback'ов
+function parseCb(data, kinds = ['unit','unit_parts','unit_img','unit_next']) {
+  const re = new RegExp(`^(?:${kinds.join('|')}):([^:]+)(?::([^:]+))?$`);
+  const m = data.match(re);
+  if (!m) return null;
+  return { kind: data.split(':')[0], unitId: String(m[1]), categoryId: m[2] ? String(m[2]) : undefined };
+}
+
+// Поддержка старого формата unit:<id>[:<categoryId>] / node:<id>[:<categoryId>]
 function parseUnitCbData(data) {
-  // поддерживаем unit: и node:
   const m = data.match(/^(?:unit|node):([^:]+)(?::([^:]+))?$/);
   if (!m) return null;
   return { unitId: String(m[1]), categoryId: m[2] ? String(m[2]) : undefined };
 }
 
-
-// ─── стало: всегда возвращаем source
+// ВСЕГДА size=source
 function buildUnitImageLinks(imageUrlRaw = '') {
   const imageUrl = String(imageUrlRaw || '').trim();
   if (!imageUrl) return null;
   const source = imageUrl.includes('%size%')
     ? imageUrl.replace('%size%', 'source')
     : imageUrl;
-  // используем source и как превью (фотка для sendPhoto), и как открывающуюся ссылку
   return { preview: source, source };
 }
 
@@ -235,24 +241,48 @@ export default class Bot {
         return;
       }
 
-      // 2.1) Выбор узла (поддержка unit: и node:)
+      // 2.1) Клик по узлу → превью (поддержка старого unit:/node:)
       if (/^(unit|node):/.test(data)) {
         const parsed = parseUnitCbData(data);
         if (!parsed?.unitId) {
           await this._safeSendMessage(q.message?.chat?.id, `Не удалось распарсить кнопку: ${data}`);
           return;
         }
-        await this._handleUnit(q, parsed.unitId, parsed.categoryId);
+        await this._showUnitPreview(q, parsed.unitId, parsed.categoryId);
         return;
       }
 
-      // 2.2) Фото узла
+      // 2.2) Открыть картинку (новый формат)
+      if (/^unit_img:/.test(data)) {
+        const p = parseCb(data, ['unit_img']);
+        if (!p) return;
+        await this._sendUnitImage(q, p.unitId, p.categoryId);
+        return;
+      }
+
+      // 2.2.1) Открыть картинку (старый формат photo:)
       if (data.startsWith('photo:')) {
         const m = data.match(/^photo:([^:]+)(?::([^:]+))?$/);
         if (!m) return;
         const unitId = String(m[1]);
         const categoryId = m[2] ? String(m[2]) : undefined;
-        await this._handleUnitPhoto(q, unitId, categoryId);
+        await this._sendUnitImage(q, unitId, categoryId);
+        return;
+      }
+
+      // 2.3) Открыть узел → parts
+      if (/^unit_parts:/.test(data)) {
+        const p = parseCb(data, ['unit_parts']);
+        if (!p) return;
+        await this._handleUnitParts(q, p.unitId, p.categoryId);
+        return;
+      }
+
+      // 2.4) Следующий узел
+      if (/^unit_next:/.test(data)) {
+        const p = parseCb(data, ['unit_next']);
+        if (!p) return;
+        await this._handleUnitNext(q, p.unitId, p.categoryId);
         return;
       }
 
@@ -410,7 +440,7 @@ export default class Bot {
       const data0 = Array.isArray(uJson.data) ? uJson.data[0] : (uJson.data || {});
       const units = data0.units || data0?.saaUnits || data0?.unit || [];
 
-      // Сохраним узлы по категории (unitId -> {ssd, code, imageUrl, ...})
+      // Сохраним узлы по категории (и порядок)
       await saveUnitsSession(userId, catalog, vehicleId || '0', String(canonicalCategoryId), units);
       await setLastCategory(userId, catalog, vehicleId || '0', String(canonicalCategoryId));
 
@@ -434,8 +464,53 @@ export default class Bot {
     }
   }
 
-  /** Шаг 4: Детали/состав по узлу */
-  async _handleUnit(q, unitId, categoryIdFromCb) {
+  /** Шаг 4A: Превью узла (картинка + кнопки) */
+  async _showUnitPreview(q, unitId, categoryIdFromCb) {
+    const chatId = q.message?.chat?.id;
+    const userId = q.from?.id;
+    if (!chatId || !userId) return;
+
+    const ctx = await getUserVehicle(userId);
+    if (!ctx?.catalog) {
+      await this._safeSendMessage(chatId, 'Контекст автомобиля не найден. Повтори VIN.');
+      return;
+    }
+    const { catalog, vehicleId } = ctx;
+
+    let categoryId = categoryIdFromCb || await getLastCategory(userId, catalog, vehicleId || '0');
+    if (!categoryId) {
+      await this._safeSendMessage(chatId, 'Не удалось определить категорию. Откройте категории заново.');
+      return;
+    }
+
+    const rec = await getUnitRecord(userId, catalog, vehicleId || '0', String(categoryId), String(unitId));
+    if (!rec) {
+      await this._safeSendMessage(chatId, 'Сессия узлов устарела. Перезагрузите категории.');
+      return;
+    }
+
+    const caption = `📎 <b>${escapeHtml(rec.name || `Узел ${unitId}`)}</b>\nID: <code>${unitId}</code>${rec.code ? `\n<code>${escapeHtml(rec.code)}</code>` : ''}`;
+    const kb = {
+      inline_keyboard: [[
+        { text: '🔧 Открыть узел', callback_data: `unit_parts:${unitId}:${categoryId}` },
+        { text: '🖼 Открыть картинку', callback_data: `unit_img:${unitId}:${categoryId}` },
+        { text: '➡️ Следующий', callback_data: `unit_next:${unitId}:${categoryId}` },
+      ]]
+    };
+
+    try {
+      if (rec.imageUrl) {
+        await this.bot.sendPhoto(chatId, rec.imageUrl, { caption, parse_mode: 'HTML', reply_markup: kb });
+      } else {
+        await this._safeSendMessage(chatId, caption, { parse_mode: 'HTML', reply_markup: kb });
+      }
+    } catch {
+      await this._safeSendMessage(chatId, caption, { parse_mode: 'HTML', reply_markup: kb });
+    }
+  }
+
+  /** Шаг 4B: Детали/состав по узлу (parts) */
+  async _handleUnitParts(q, unitId, categoryIdFromCb) {
     const chatId = q.message?.chat?.id;
     const userId = q.from?.id;
     if (!chatId || !userId) return;
@@ -447,14 +522,9 @@ export default class Bot {
 
       const { catalog, vehicleId } = ctx;
 
-      // Определим categoryId: либо из callback_data, либо «последняя выбранная»
-      let categoryId = categoryIdFromCb;
-      if (!categoryId) {
-        categoryId = await getLastCategory(userId, catalog, vehicleId || '0');
-      }
+      let categoryId = categoryIdFromCb || await getLastCategory(userId, catalog, vehicleId || '0');
       if (!categoryId) throw new Error('Не удалось определить категорию. Откройте категории заново.');
 
-      // Достанем узел из кэша и возьмём ssd
       const rec = await getUnitRecord(userId, catalog, vehicleId || '0', String(categoryId), String(unitId));
       const ssd = rec?.ssd;
       if (!ssd) throw new Error('Не найден ssd узла в сессии. Перезагрузите категории.');
@@ -462,7 +532,6 @@ export default class Bot {
       const base = (process.env.LAXIMO_BASE_URL || '').replace(/\/+$/, '');
       if (!base) throw new Error('Не настроен LAXIMO_BASE_URL');
 
-      // Правильный вызов: по ssd узла
       const uUrl = new URL(base + '/unit');
       uUrl.searchParams.set('catalog', catalog);
       uUrl.searchParams.set('vehicleId', vehicleId || '0');
@@ -490,14 +559,10 @@ export default class Bot {
         return `${i + 1}. ${name}${art ? ` (${art})` : ''}`;
       });
 
-      // Кнопки: Фото (если есть картинка), Открыть узел (в вашу веб-морду), Навигация
       const kbRows = [];
       if (rec?.imageUrl) {
-        kbRows.push([{ text: '🖼 Фото узла', callback_data: `photo:${unitId}:${categoryId}` }]);
+        kbRows.push([{ text: '🖼 Фото узла', callback_data: `unit_img:${unitId}:${categoryId}` }]);
       }
-      // Пример ссылки "Открыть узел" — адаптируйте под вашу веб-морду:
-      const openUrl = `${base}/units?catalog=${encodeURIComponent(catalog)}&vehicleId=${encodeURIComponent(vehicleId || '0')}&ssd=${encodeURIComponent(ssd)}&categoryId=${encodeURIComponent(categoryId)}#unit=${encodeURIComponent(unitId)}`;
-      kbRows.push([{ text: '🔗 Открыть узел', url: openUrl }]);
 
       await this._safeSendMessage(chatId, [
         `🔩 Узел: <b>${escapeHtml(rec?.name || String(unitId))}</b>${rec?.code ? `\n<code>${escapeHtml(rec.code)}</code>` : ''}`,
@@ -519,8 +584,8 @@ export default class Bot {
     }
   }
 
-  /** Фото узла: превью + кнопки 1200px / Оригинал / Назад */
-  async _handleUnitPhoto(q, unitId, categoryIdFromCb) {
+  /** Шаг 4C: Фото узла */
+  async _sendUnitImage(q, unitId, categoryIdFromCb) {
     const chatId = q.message?.chat?.id;
     const userId = q.from?.id;
     if (!chatId || !userId) return;
@@ -532,12 +597,9 @@ export default class Bot {
 
       const { catalog, vehicleId } = ctx;
 
-      // Понимаем категорию: из callback_data или последняя
-      let categoryId = categoryIdFromCb;
-      if (!categoryId) categoryId = await getLastCategory(userId, catalog, vehicleId || '0');
+      let categoryId = categoryIdFromCb || await getLastCategory(userId, catalog, vehicleId || '0');
       if (!categoryId) throw new Error('Не удалось определить категорию. Откройте категории заново.');
 
-      // Берём узел из кэша (там есть imageUrl и code после фикса normalizeUnit)
       const rec = await getUnitRecord(userId, catalog, vehicleId || '0', String(categoryId), String(unitId));
       if (!rec) throw new Error('Узел не найден в кэше. Перезагрузите категории.');
       const links = buildUnitImageLinks(rec.imageUrl);
@@ -549,15 +611,14 @@ export default class Bot {
       ].filter(Boolean).join('\n');
 
       const kb = {
-  inline_keyboard: [
-    [
-      { text: 'Открыть изображение', url: links.source },
-    ],
-    [
-      { text: '⬅️ Назад', callback_data: `unit:${unitId}:${categoryId}` },
-    ]
-  ]
-};
+        inline_keyboard: [
+          [{ text: 'Открыть изображение', url: links.source }],
+          [
+            { text: '🔧 Открыть узел', callback_data: `unit_parts:${unitId}:${categoryId}` },
+            { text: '➡️ Следующий', callback_data: `unit_next:${unitId}:${categoryId}` },
+          ]
+        ]
+      };
 
       await this.bot.sendPhoto(chatId, links.preview, {
         caption,
@@ -572,6 +633,33 @@ export default class Bot {
         { parse_mode: 'HTML' }
       );
     }
+  }
+
+  /** Шаг 4D: «Следующий» узел */
+  async _handleUnitNext(q, unitId, categoryIdFromCb) {
+    const chatId = q.message?.chat?.id;
+    const userId = q.from?.id;
+    if (!chatId || !userId) return;
+
+    const ctx = await getUserVehicle(userId);
+    if (!ctx?.catalog) {
+      await this._safeSendMessage(chatId, 'Контекст автомобиля не найден. Повтори VIN.');
+      return;
+    }
+    const { catalog, vehicleId } = ctx;
+
+    let categoryId = categoryIdFromCb || await getLastCategory(userId, catalog, vehicleId || '0');
+    if (!categoryId) {
+      await this._safeSendMessage(chatId, 'Не удалось определить категорию. Откройте категории заново.');
+      return;
+    }
+
+    const nextId = await getNextUnitId(userId, catalog, vehicleId || '0', String(categoryId), String(unitId));
+    if (!nextId) {
+      await this._safeSendMessage(chatId, 'Список узлов пуст или устарел. Перезагрузите категории.');
+      return;
+    }
+    await this._showUnitPreview(q, nextId, categoryId);
   }
 
   async _editOrSend(chatId, messageId, text, opts) {
@@ -620,6 +708,7 @@ function ensureCategoryInUnitCallbacks(reply_markup, categoryId) {
       if (m[3]) return btn; // уже есть categoryId
       const prefix = m[1];
       const uid = m[2];
+      // заменяем действие на unit:<id>:<catId> для показа превью
       return { ...btn, callback_data: `${prefix}:${uid}:${categoryId}` };
     })
   );
