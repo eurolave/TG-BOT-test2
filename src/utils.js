@@ -2,28 +2,35 @@
 
 /**
  * Бросает ошибку, если значение "пустое".
+ * Пустым считаем: undefined | null | '' | false.
+ * Можно передать ленивое сообщение (функцию).
  * @template T
  * @param {T} v
- * @param {string} msg
+ * @param {string | (() => string)} msg
  * @returns {T}
  */
 export function ensure(v, msg) {
-  if (v === undefined || v === null || v === '' || v === false) {
-    throw new Error(msg || 'Value is required');
+  const empty = v === undefined || v === null || v === '' || v === false;
+  if (empty) {
+    const m = typeof msg === 'function' ? msg() : msg;
+    throw new Error(m || 'Value is required');
   }
-  return v;
+  return /** @type {T} */ (v);
 }
 
 /**
- * Бьёт строку на куски заданного размера, устойчиво к суррогатным парам (эмодзи и т.п.).
+ * Бьёт строку на куски заданного размера, корректно по кодпоинтам (эмодзи не рвутся).
  * По умолчанию ~3500 символов (безопасно для Telegram, лимит 4096).
+ * size < 1 → возвращает исходную строку одним куском.
  * @param {string} str
  * @param {number} [size=3500]
  * @returns {string[]}
  */
 export function chunk(str, size = 3500) {
+  const s = String(str);
+  if (!Number.isFinite(size) || size < 1) return [s];
   const out = [];
-  const arr = Array.from(String(str)); // безопасно по кодпоинтам
+  const arr = Array.from(s); // кодпоинты
   for (let i = 0; i < arr.length; i += size) {
     out.push(arr.slice(i, i + size).join(''));
   }
@@ -31,49 +38,58 @@ export function chunk(str, size = 3500) {
 }
 
 /**
- * Маскирует VIN вида ABC***XYZ (оставляет первые 3 и последние 3 символа).
- * Если короче 6 — возвращает исходное.
- * Пробелы обрезаются, регистр нормализуется к верхнему.
- * @param {string} v
+ * Маскирует VIN вида ABC***XYZ (оставляет первые 3 и последние 3).
+ * Нормализует: удаляет пробелы/дефисы, переводит к upper-case.
+ * Если после нормализации короче 6 — вернёт как есть.
+ * @param {string} vin
  * @returns {string}
  */
-export function maskVin(v) {
-  const raw = String(v || '').trim().toUpperCase();
+export function maskVin(vin) {
+  const raw = String(vin || '')
+    .replace(/[\s-]+/g, '')
+    .toUpperCase();
   if (raw.length < 6) return raw;
   return `${raw.slice(0, 3)}***${raw.slice(-3)}`;
 }
 
 /**
- * Экранирует HTML-спецсимволы (& < > " ').
+ * Экранирует HTML (& < > " ').
  * @param {string} s
  * @returns {string}
  */
 export function escapeHtml(s) {
   return String(s)
     .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
+    .replace(/<//g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
 
 /**
- * Грубое определение языка по locale (ru_RU → 'ru', иначе 'en').
+ * Грубое определение языка по locale ('ru_RU' → 'ru', иначе 'en').
  * @param {string} locale
  * @returns {'ru'|'en'}
  */
 export function detectLangFromLocale(locale) {
-  const l = String(locale || '').toLowerCase();
-  return l.startsWith('ru') ? 'ru' : 'en';
+  const l = String(locale || '').trim().toLowerCase();
+  const main = l.split(/[_-]/)[0]; // 'ru-ru' | 'ru_RU' → 'ru'
+  return main === 'ru' ? 'ru' : 'en';
 }
 
 /**
- * Эмодзи по бренду (best-effort). Возвращает 🚗 по умолчанию.
+ * Эмодзи по бренду (best-effort). По умолчанию '🚗'.
+ * Нормализует пробелы и дефисы.
  * @param {string} brand
  * @returns {string}
  */
 export function brandEmoji(brand) {
-  const b = String(brand || '').trim().toUpperCase().replace(/\s+/g, ' ');
+  const b = String(brand || '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, ' ');
+  const key = b.replace(/-/g, ' ');
+  /** @type {Record<string,string>} */
   const map = {
     'AUDI': '🚘',
     'SKODA': '🚙',
@@ -82,7 +98,7 @@ export function brandEmoji(brand) {
     'SEAT': '🚗',
     'BMW': '🏎️',
     'MERCEDES': '🚘',
-    'MERCEDES-BENZ': '🚘',
+    'MERCEDES BENZ': '🚘',
     'MB': '🚘',
     'TOYOTA': '🚙',
     'LEXUS': '🚙',
@@ -109,38 +125,49 @@ export function brandEmoji(brand) {
     'SUZUKI': '🚗',
     'FIAT': '🚗',
     'ALFA ROMEO': '🏎️',
-    'TESLA': '🔋',
+    'TESLA': '🔋'
   };
-  return map[b] || map[b.replace(/-/g, ' ')] || '🚗';
+  return map[b] || map[key] || '🚗';
 }
 
 /**
  * Форматирование суммы.
- * Если currency — символ (например, '₽', '€', '$'), добавляет его после числа с неразрывным пробелом.
- * Если currency — ISO-код (например, 'RUB', 'EUR', 'USD'), используется Intl.NumberFormat.
+ * Если currency — ISO-код (RUB/EUR/USD) → Intl.NumberFormat.
+ * Если currency — символ ('₽', '€', '$') → "1234.56 ₽".
  * @param {number|string} n
- * @param {string} [currency='₽']  Символ ('₽') или код ('RUB')
+ * @param {string} [currency='₽'] Символ или ISO-код
  * @param {string} [locale='ru-RU']
  * @returns {string}
  */
 export function fmtMoney(n, currency = '₽', locale = 'ru-RU') {
   const value = Number(n);
-  if (!Number.isFinite(value)) return `0.00 ${currency}`;
+  if (!Number.isFinite(value)) return `0.00\u00A0${currency}`;
 
-  const isIsoCode = /^[A-Z]{3}$/.test(currency);
-  if (isIsoCode) {
+  const isIso = /^[A-Z]{3}$/.test(currency);
+  if (isIso) {
     try {
       return new Intl.NumberFormat(locale, {
         style: 'currency',
         currency,
-        currencyDisplay: 'symbol',
+        currencyDisplay: 'narrowSymbol',
         minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
+        maximumFractionDigits: 2
       }).format(value);
     } catch {
-      // fallback к символу, если код не поддерживается
+      // если код не поддерживается движком — свалимся в символ ниже
     }
   }
-  const amount = value.toFixed(2);
-  return `${amount}\u00A0${currency}`; // NBSP между суммой и символом
+
+  // символ/строка — простой формат
+  return `${value.toFixed(2)}\u00A0${currency}`; // NBSP между суммой и символом
+}
+
+/**
+ * Утилита для картинок Laximo: подставляет оригинальный размер (source).
+ * Пример: https://img.laximo.ru/AU1587/%size%/022/022013000.gif → .../source/022/022013000.gif
+ * @param {string} url
+ * @returns {string}
+ */
+export function imageSource(url) {
+  return String(url || '').replace('%size%', 'source');
 }
