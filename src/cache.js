@@ -3,9 +3,9 @@
 
 import { createClient } from 'redis';
 
-const TTL_CATS = 900;  // 15 минут
-const TTL_CTX  = 3600; // 60 минут
-const TTL_UNITS = 900; // 15 минут
+const TTL_CATS  = 900;  // 15 минут
+const TTL_CTX   = 3600; // 60 минут
+const TTL_UNITS = 900;  // 15 минут
 
 let redis = null;
 const mem = new Map(); // key -> { value, exp }
@@ -50,7 +50,16 @@ function normalizeUnit(u = {}) {
   const unitId = u.unitId ?? u.id ?? u.UnitId ?? u.ID ?? u.Id ?? null;
   const name   = u.name ?? u.UnitName ?? u.title ?? '';
   const ssd    = u.ssd ?? u.SSD ?? u.Ssd ?? u.sSd ?? null;
-  return { unitId: unitId != null ? String(unitId) : null, name, ssd, raw: u };
+  const code   = u.code ?? u.Code ?? '';
+  const imageUrl = u.imageUrl ?? u.ImageUrl ?? '';
+  return {
+    unitId: unitId != null ? String(unitId) : null,
+    name,
+    ssd,
+    code,
+    imageUrl,
+    raw: u
+  };
 }
 
 /** ───────── High-level API: категории ───────── */
@@ -71,7 +80,12 @@ async function readCategoriesSession(userId, catalog, vehicleId) {
   const r = await getRedis();
   const raw = r ? await r.get(key) : memGet(key);
   if (!raw) return null;
-  try { const arr = JSON.parse(raw) || []; return Array.isArray(arr) ? arr : []; } catch { return []; }
+  try {
+    const arr = JSON.parse(raw) || [];
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
 }
 
 export async function getCategoryRecord(userId, catalog, vehicleId, categoryId) {
@@ -102,7 +116,7 @@ export async function getCategoriesRoot(userId, catalog, vehicleId) {
 }
 
 /** ───────── High-level API: узлы (units) ─────────
- *  Сохраняем по ключу user+catalog+vehicle+category -> Map(unitId -> {unitId, name, ssd, raw})
+ *  Сохраняем по ключу user+catalog+vehicle+category -> Map(unitId -> {unitId, name, ssd, ...})
  */
 export async function saveUnitsSession(userId, catalog, vehicleId, categoryId, unitsArray, ttlSec = TTL_UNITS) {
   const key = `units:${userId}:${catalog}:${vehicleId}:${categoryId}`;
@@ -164,7 +178,11 @@ export async function getUserVehicle(userId) {
 export async function cacheSet(key, value, ttlSec = 900) {
   const r = await getRedis();
   const payload = JSON.stringify(value);
-  if (r) { await r.set(key, payload, { EX: ttlSec }); } else { memSet(key, payload, ttlSec); }
+  if (r) {
+    await r.set(key, payload, { EX: ttlSec });
+  } else {
+    memSet(key, payload, ttlSec);
+  }
 }
 
 export async function cacheGet(key) {
