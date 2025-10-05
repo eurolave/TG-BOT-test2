@@ -47,18 +47,19 @@ function normalizeCategory(c = {}) {
 }
 
 function normalizeUnit(u = {}) {
-  const unitId = u.unitId ?? u.id ?? u.UnitId ?? u.ID ?? u.Id ?? null;
-  const name   = u.name ?? u.UnitName ?? u.title ?? '';
-  const ssd    = u.ssd ?? u.SSD ?? u.Ssd ?? u.sSd ?? null;
-  const code   = u.code ?? u.Code ?? '';
-  const imageUrl = u.imageUrl ?? u.ImageUrl ?? '';
+  const unitId   = u.unitId ?? u.id ?? u.UnitId ?? u.ID ?? u.Id ?? null;
+  const name     = u.name   ?? u.UnitName ?? u.title ?? '';
+  const ssd      = u.ssd    ?? u.SSD ?? u.Ssd ?? u.sSd ?? null;
+  const code     = u.code   ?? u.UnitCode ?? u.Code ?? null;
+  const imageUrl = u.imageUrl ?? u.ImageUrl ?? u.img ?? null;
+
   return {
     unitId: unitId != null ? String(unitId) : null,
     name,
     ssd,
     code,
     imageUrl,
-    raw: u
+    raw: u,
   };
 }
 
