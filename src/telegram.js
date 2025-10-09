@@ -509,80 +509,92 @@ export default class Bot {
     }
   }
 
-  /** Шаг 4B: Детали/состав по узлу (parts) */
-  async _handleUnitParts(q, unitId, categoryIdFromCb) {
-    const chatId = q.message?.chat?.id;
-    const userId = q.from?.id;
-    if (!chatId || !userId) return;
+  /** Шаг 4B: Детали/состав по узлу (parts) — через /unit-details (ListDetailByUnit) */
+async _handleUnitParts(q, unitId, categoryIdFromCb) {
+  const chatId = q.message?.chat?.id;
+  const userId = q.from?.id;
+  if (!chatId || !userId) return;
 
-    try {
-      await this.bot.sendChatAction(chatId, 'typing').catch(() => {});
-      const ctx = await getUserVehicle(userId);
-      if (!ctx?.catalog) throw new Error('Контекст автомобиля не найден. Повтори VIN.');
+  try {
+    await this.bot.sendChatAction(chatId, 'typing').catch(() => {});
+    const ctx = await getUserVehicle(userId);
+    if (!ctx?.catalog) throw new Error('Контекст автомобиля не найден. Повтори VIN.');
 
-      const { catalog, vehicleId } = ctx;
+    const { catalog, vehicleId } = ctx;
 
-      let categoryId = categoryIdFromCb || await getLastCategory(userId, catalog, vehicleId || '0');
-      if (!categoryId) throw new Error('Не удалось определить категорию. Откройте категории заново.');
+    // Определяем категорию (из callback или из "последней")
+    let categoryId = categoryIdFromCb || await getLastCategory(userId, catalog, vehicleId || '0');
+    if (!categoryId) throw new Error('Не удалось определить категорию. Откройте категории заново.');
 
-      const rec = await getUnitRecord(userId, catalog, vehicleId || '0', String(categoryId), String(unitId));
-      const ssd = rec?.ssd;
-      if (!ssd) throw new Error('Не найден ssd узла в сессии. Перезагрузите категории.');
+    // SSD КАТЕГОРИИ — нужен для ListDetailByUnit
+    const catRec = await getCategoryRecord(userId, catalog, vehicleId || '0', String(categoryId));
+    const categorySsd = catRec?.ssd;
+    if (!categorySsd) throw new Error('Не найден ssd категории в сессии. Перезагрузите категории.');
 
-      const base = (process.env.LAXIMO_BASE_URL || '').replace(/\/+$/, '');
-      if (!base) throw new Error('Не настроен LAXIMO_BASE_URL');
+    const base = (process.env.LAXIMO_BASE_URL || '').replace(/\/+$/, '');
+    if (!base) throw new Error('Не настроен LAXIMO_BASE_URL');
 
-      const uUrl = new URL(base + '/unit');
-      uUrl.searchParams.set('catalog', catalog);
-      uUrl.searchParams.set('vehicleId', vehicleId || '0');
-      uUrl.searchParams.set('ssd', String(ssd));
+    // Вызываем /unit-details (ListDetailByUnit)
+    const uUrl = new URL(base + '/unit-details');
+    uUrl.searchParams.set('catalog', catalog);
+    uUrl.searchParams.set('vehicleId', vehicleId || '0');
+    uUrl.searchParams.set('unitId', String(unitId));
+    uUrl.searchParams.set('ssd', String(categorySsd)); // ВАЖНО: SSD категории, НЕ SSD узла
+    uUrl.searchParams.set('locale', process.env.DEFAULT_LOCALE || 'ru_RU');
+    // можно явно, но на бэке и так проставляется true:
+    uUrl.searchParams.set('localized', 'true');
+    uUrl.searchParams.set('withLinks', 'true');
 
-      const uRes = await fetch(uUrl.toString());
-      const uJson = await uRes.json().catch(() => ({}));
-      if (!uJson?.ok) throw new Error(uJson?.error || 'Не удалось получить состав узла');
+    const uRes = await fetch(uUrl.toString());
+    const uJson = await uRes.json().catch(() => ({}));
+    if (!uJson?.ok) throw new Error(uJson?.error || 'Не удалось получить состав узла');
 
-      const partsArr = extractUnitParts(uJson.data);
-      if (!partsArr.length) {
-        const keysHint = uJson?.data && typeof uJson.data === 'object'
-          ? Object.keys(uJson.data).join(', ')
-          : Array.isArray(uJson?.data) ? 'array' : typeof uJson?.data;
-        await this._safeSendMessage(
-          chatId,
-          `По узлу ${unitId} детали не найдены (ssd: ${ssd}).\nКлючи ответа: ${keysHint}`
-        );
-        return;
-      }
+    const partsArr = extractUnitParts(uJson.data);
+    // Для заголовка/кнопок хотим имя/код узла — берём из сессии узлов:
+    const rec = await getUnitRecord(userId, catalog, vehicleId || '0', String(categoryId), String(unitId));
 
-      const lines = partsArr.slice(0, 30).map((p, i) => {
-        const name = p.name || p.partName || p.PartName || p.article || p.oem || '—';
-        const art  = p.article || p.oem || p.Oem || '';
-        return `${i + 1}. ${name}${art ? ` (${art})` : ''}`;
-      });
-
-      const kbRows = [];
-      if (rec?.imageUrl) {
-        kbRows.push([{ text: '🖼 Фото узла', callback_data: `unit_img:${unitId}:${categoryId}` }]);
-      }
-
-      await this._safeSendMessage(chatId, [
-        `🔩 Узел: <b>${escapeHtml(rec?.name || String(unitId))}</b>${rec?.code ? `\n<code>${escapeHtml(rec.code)}</code>` : ''}`,
-        '',
-        lines.join('\n'),
-        partsArr.length > 30 ? `… и ещё ${partsArr.length - 30}` : ''
-      ].join('\n'), {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        reply_markup: { inline_keyboard: kbRows }
-      });
-
-    } catch (e) {
+    if (!partsArr.length) {
+      const keysHint = uJson?.data && typeof uJson.data === 'object'
+        ? Object.keys(uJson.data).join(', ')
+        : Array.isArray(uJson?.data) ? 'array' : typeof uJson?.data;
       await this._safeSendMessage(
         chatId,
-        `Не удалось получить состав узла: <code>${escapeHtml(String(e?.message || e))}</code>`,
-        { parse_mode: 'HTML' }
+        `По узлу ${unitId} детали не найдены (SSD категории: ${categorySsd}).\nКлючи ответа: ${keysHint}`
       );
+      return;
     }
+
+    const lines = partsArr.slice(0, 30).map((p, i) => {
+      const name = p.name || p.partName || p.PartName || p.article || p.oem || '—';
+      const art  = p.article || p.oem || p.Oem || '';
+      return `${i + 1}. ${name}${art ? ` (${art})` : ''}`;
+    });
+
+    const kbRows = [];
+    if (rec?.imageUrl) {
+      kbRows.push([{ text: '🖼 Фото узла', callback_data: `unit_img:${unitId}:${categoryId}` }]);
+    }
+    kbRows.push([{ text: '➡️ Следующий', callback_data: `unit_next:${unitId}:${categoryId}` }]);
+
+    await this._safeSendMessage(chatId, [
+      `🔩 Узел: <b>${escapeHtml(rec?.name || String(unitId))}</b>${rec?.code ? `\n<code>${escapeHtml(rec.code)}</code>` : ''}`,
+      '',
+      lines.join('\n'),
+      partsArr.length > 30 ? `… и ещё ${partsArr.length - 30}` : ''
+    ].join('\n'), {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: kbRows }
+    });
+
+  } catch (e) {
+    await this._safeSendMessage(
+      chatId,
+      `Не удалось получить состав узла: <code>${escapeHtml(String(e?.message || e))}</code>`,
+      { parse_mode: 'HTML' }
+    );
   }
+}
 
   /** Шаг 4C: Фото узла */
   async _sendUnitImage(q, unitId, categoryIdFromCb) {
