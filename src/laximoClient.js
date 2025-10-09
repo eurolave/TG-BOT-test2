@@ -101,14 +101,19 @@ export async function getUnitDetailsByUnitId(
   catalog,
   vehicleId,
   unitId,
-  ssd,
+  ssd, // SSD категории (а не unit.ssd)
   locale = DEFAULT_LOCALE,
-  opts = { localized: true, withLinks: true, force: false }
+  opts = {}
 ) {
   assertBase();
-  const localized  = opts.localized !== false;
-  const withLinks  = opts.withLinks !== false;
-  const force      = !!opts.force;
+  const localized = opts.localized !== false; // по умолчанию true
+  const withLinks = opts.withLinks !== false; // по умолчанию true
+  const force     = !!opts.force;
+
+  // Защитимся от случайного пустого SSD
+  if (!ssd || typeof ssd !== 'string') {
+    throw new Error('unit-details: ssd (context) is required and must be a string');
+  }
 
   const key = `unitdet:${catalog}:${vehicleId || '0'}:${String(unitId)}:${h(ssd)}:${locale}:${localized?1:0}:${withLinks?1:0}`;
 
@@ -117,7 +122,15 @@ export async function getUnitDetailsByUnitId(
     if (cached) return cached;
   }
 
-  const url = `${BASE}/unit-details?catalog=${encodeURIComponent(catalog)}&vehicleId=${encodeURIComponent(vehicleId || '0')}&unitId=${encodeURIComponent(String(unitId))}&ssd=${encodeURIComponent(ssd)}&locale=${encodeURIComponent(locale)}&localized=${String(localized)}&withLinks=${String(withLinks)}`;
+  const url = `${BASE}/unit-details` +
+    `?catalog=${encodeURIComponent(catalog)}` +
+    `&vehicleId=${encodeURIComponent(vehicleId || '0')}` +
+    `&unitId=${encodeURIComponent(String(unitId))}` +
+    `&ssd=${encodeURIComponent(ssd)}` +
+    `&locale=${encodeURIComponent(locale)}` +
+    `&localized=${String(localized)}` +
+    `&withLinks=${String(withLinks)}`;
+
   const data = await jsonFetch(url);
 
   try { await cacheSet(key, data, UNITDET_TTL); } catch {}
