@@ -137,6 +137,7 @@ export async function getUnitDetailsByUnitId(
   return data;
 }
 
+
 /**
  * Оставляю и этот вариант — если ты используешь /unit по ssd узла.
  * REST: /unit?catalog=...&vehicleId=...&ssd=...&locale=...
